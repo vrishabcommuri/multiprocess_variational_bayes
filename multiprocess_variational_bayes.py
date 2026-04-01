@@ -1,1303 +1,679 @@
+import subprocess
+import multiprocessing
+from multiprocessing import Pool
+# from workers import simple_worker_norandslopes_counterfactual, power_analysis
+
 import numpy as np
 import pymc as pm
 import arviz as az
-import multiprocessing
-from multiprocessing import Pool
 import pytensor
-import os
 import warnings
 import pymc_extras as pmx 
+import pytensor.tensor as pt
+import os
+import pandas as pd
+import bambi as bmb
+import copy
+import pathlib
 
 
-def make_model(subs, usemask):
-    # need to have a random intercept for all subjects, even if some have no 
-    # usable data (filtered) out by usemask
-    n_subs = len(np.unique(subs)) 
-    subs = subs[usemask]
-    datavec = np.zeros(usemask.sum())
-    y_shared = pytensor.shared(datavec) # initialized value, not compiled
-    covar_shared = pytensor.shared(datavec)
-    covar_null_shared = pytensor.shared(datavec)
-
-    with pm.Model(check_bounds=True) as fullmodel:
-        # model random effects priors
-        sigma_sub = pm.HalfNormal("subject_re_sigma", sigma=10)
-        subject_offset = pm.Normal("subject_offset", mu=0, sigma=1, shape=n_subs)
-        subject_effects = pm.Deterministic("subject_effects", subject_offset * sigma_sub)
-
-        # model fixed effects priors
-        beta = pm.Normal('covar', mu=0, sigma=1)#, initval=0)
-        intercept = pm.Normal('intercept', mu=0, sigma=10)#, initval=0)
-
-        p = pm.Deterministic("p", pm.math.invlogit(intercept + pm.math.dot(beta, covar_shared) + subject_effects[subs]))
-
-        # observations
-        observed = pm.Bernoulli("bernoulli_obs", p, observed=y_shared)
+def fit_fullmodel(obs, obs_nonzero, cv, subs, exposure, samplemode='nuts'):
+    with pm.Model() as fullmodel:
+        cv_data = pm.Data("cv_data", cv)
+        subs_data = pm.Data("sub_idx", subs)
+        obs_data = pm.Data("obs_data", obs_nonzero)
+        obs_full = pm.Data("obs_full", obs)
         
-    with pm.Model(check_bounds=True) as nullmodel:
-        # model random effects priors
-        sigma_sub = pm.HalfNormal("subject_re_sigma", sigma=10)
-        subject_offset = pm.Normal("subject_offset", mu=0, sigma=1, shape=n_subs)
-        subject_effects = pm.Deterministic("subject_effects", subject_offset * sigma_sub)
+        # fixed effects parameters
+        intercept = pm.Normal("intercept", mu=0, sigma=5)                 # population baseline log-mean
+        beta = pm.Normal('beta', 0, 1, shape=(1))
 
-        # model fixed effects priors
-        beta = pm.Normal('covar', mu=0, sigma=1)#, initval=0)
-        intercept = pm.Normal('intercept', mu=0, sigma=10)#, initval=0)
+        # random effects (1|subject)
+        sigma_sub = pm.HalfNormal("subject_re_sigma", sigma=2.5)
+        subject_offset = pm.Normal("subject_offset", mu=0, sigma=0.5, shape=pm.math.max(subs_data) + 1)
+        subject_effects = pm.Deterministic("RE", subject_offset * sigma_sub)
 
-        p = pm.Deterministic("p", pm.math.invlogit(intercept + pm.math.dot(beta, covar_null_shared) + subject_effects[subs]))
+        # linear predictor
+        eta_fixed = (cv_data @ beta)   # fixed effects
+        eta = intercept + eta_fixed + exposure + subject_effects[subs_data]
 
-        # observations
-        observed = pm.Bernoulli("bernoulli_obs", p, observed=y_shared)
-    return fullmodel, nullmodel, covar_shared, covar_null_shared, y_shared
+        mu  = pm.Deterministic('mu', pm.math.exp(eta))
+        psi = pm.Beta("psi", 1, 1)
 
-def worker(chunk):
-    print(f"running full model process {os.getpid()}")
-    if len(chunk) == 0:
-        return None
-    
-    subs = chunk[0][-3]
-    usemask = chunk[0][-2]
-    posteriormode = chunk[0][-1]
-    if posteriormode not in ["fullposterior", 'posteriormeans']:
-        raise Exception(f"posterior mode {posteriormode} not supported")
-    
-    n_subs = len(np.unique(subs))
-    fullmodel, nullmodel, xs, xns, ys = make_model(subs, usemask) 
-    trueresults = []
-    nullresults = []
-    for i, j, data, covar, n_nulls, subs, usemask, posteriormode in chunk:
-        ys.set_value(data[usemask])
-        xs.set_value(covar[usemask])
+        y_obs = pm.Poisson("y_obs", mu=mu, observed=obs_data)
+        pm.Bernoulli("y_bernoulli", p=1 - psi, observed=(obs_full == 0) * 1.0)
 
-        # fit true model
-        with fullmodel:
-            approx = pm.fit(method='advi', progressbar=False, callbacks=[])
-            trace_full = approx.sample(1000)
-            trueresults.append([i, j, trace_full.posterior['covar'].values, 
-                                trace_full.posterior['intercept'].values,
-                                trace_full.posterior['subject_effects'].values])
-            
+        # see if sampler converges with obtaining invalid values
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
 
-        # fit null models
-        for nmi in range(n_nulls):
-            print(f"link {j}->{i} running null model {nmi}")
-            covar_null = covar.copy().reshape(n_subs, -1)
-            np.random.seed(nmi)
-            np.random.shuffle(covar_null)
-            covar_null = covar_null.flatten()
-            covar_null = covar_null[usemask]
-            xns.set_value(covar_null)
-            with nullmodel:
+            try:
+                if samplemode == 'advi':
+                    approx = pm.fit(method='advi', progressbar=False, callbacks=[])
+                    tracefulltrue = approx.sample(4000)
+                else:
+                    tracefulltrue = pm.sample(4000, chains=4, return_inferencedata=True, 
+                            target_accept=0.95, cores=1, idata_kwargs={"log_likelihood": True}, 
+                            progressbar=False)
+                badconvflag = False
+
+            except RuntimeWarning as e:
+                print(f"true model {i}->{j} caught a RuntimeWarning exception:", e)
+                badconvflag = True
+
+        # here the sampler will raise a runtime warning but will still proceed with sampling
+        # this way we will still obtain estimates, just with the knowledge that something
+        # didn't go right
+        if badconvflag:
+            print("badconv, retry with tighened target accept")
+            if samplemode == 'advi':
                 approx = pm.fit(method='advi', progressbar=False, callbacks=[])
-                trace_null = approx.sample(1000)
-                if posteriormode == 'fullposterior':
-                    nullresults.append([i, j, trace_null.posterior['covar'].values])
-                else:
-                    nullresults.append([i, j, trace_null.posterior['covar'].values.mean()])
+                tracefulltrue = approx.sample(4000)
+            else:
+                tracefulltrue = pm.sample(4000, chains=4, return_inferencedata=True, 
+                        target_accept=0.98, cores=1, idata_kwargs={"log_likelihood": True}, 
+                        progressbar=False)
+
+    post = tracefulltrue.posterior
+
+    _intercept = post['intercept'].mean(dim=('chain', 'draw')).values
+    _mu = post['mu'].mean(dim=('chain', 'draw')).values
+    _psi = post['psi'].mean().item()
+    posterior_subsamples = {
+        "intercept": _intercept, 
+        "beta": post['beta'].mean(dim=('chain', 'draw')).values,
+        "RE": post["RE"].mean(dim=("chain", "draw")).values,
+        "mu": _mu,
+        "psi": _psi,
+        "exposure": exposure,
+        "obs": obs,
+        "badconv": badconvflag,
+    }
+    rhat = None # az.rhat(tracefulltrue)
+    return tracefulltrue, fullmodel, rhat, posterior_subsamples
+
+def generate_data(idata, samplesize, N_trials, obs_nonzero, cv, subs, exposure):
+    # subject RE offset is a zero-mean normal with std sigma the prior for
+    # this is fairly wide, so feeding new unobserved (out of sample)
+    # subjects through the likelihood with the default will overrepresent
+    # the within-subject variability. instead, we take the average std for
+    # subject offsets in our preliminary data and use that as the sigma for
+    # new priors for the unobserved subjects.
+    sigma_offset_hat = idata.posterior['subject_offset'].values\
+                                    .reshape(-1, 5).std(axis=0).mean()
+
+    # some proportion of the preliminary data for this cell was zero, and we
+    # are fitting ztp models which exclude zeros, so our artificial data
+    # should drop that proportion of counts
+    p_hat = idata.posterior['psi'].mean().item()
+
+    N_new_subs = samplesize
+    # N_trials pre and post per subject
+    new_cv = np.array(([0] * N_trials + [1] * N_trials) *\
+                                    N_new_subs)[:, np.newaxis]
+    new_subs = np.repeat(np.array(list(range(N_new_subs))) + max(subs), 
+                                    N_trials * 2)
+    np.random.seed(0)
+    # drop p_hat proportion of data 
+    new_usemask = np.random.binomial(n=1, 
+                        p=idata.posterior['psi'].mean().item(), 
+                        size=len(new_subs)).astype(bool)
+
+    new_cv = np.concatenate([cv, new_cv[new_usemask]])
+    new_subs = np.concatenate([subs, new_subs[new_usemask]])
+    new_obs = np.zeros_like(new_subs)
+    
+    with pm.Model() as fullmodel_extended: 
+        # dummy vars; names need to be in model graph for set_data
+        cv_data = pm.Data("cv_data", cv)
+        subs_data = pm.Data("sub_idx", subs)
+        obs_data = pm.Data("obs_data", obs_nonzero)
         
-    return trueresults, nullresults
-
-
-def simple_worker(chunk):
-    print(f"running full model process {os.getpid()}")
-    if len(chunk) == 0:
-        return None
-    
-    subs = chunk[0][-3]
-    usemask = chunk[0][-2]
-    posteriormode = chunk[0][-1]
-    if posteriormode not in ["fullposterior", 'posteriormeans', 'trace']:
-        raise Exception(f"posterior mode {posteriormode} not supported")
-    
-    n_subs = len(np.unique(subs))
-    trueresults = []
-    nullresults = []
-    for i, j, data, covar, n_nulls, subs, usemask, posteriormode in chunk:
-        obs = data[usemask]
-        cv = covar[usemask]
-
-        # fit true model
-        with pm.Model() as fullmodel:
-            sigma_sub = pm.HalfNormal("subject_re_sigma", sigma=10)
-            subject_offset = pm.Normal("subject_offset", mu=0, sigma=1, shape=n_subs)
-            subject_effects = pm.Deterministic("subject_effects", subject_offset * sigma_sub)
-            
-            # model fixed effects priors
-            beta = pm.Normal('covar', mu=0, sigma=1)
-            intercept = pm.Normal('intercept', mu=0, sigma=10)
-
-            p = pm.Deterministic("p", pm.math.invlogit(intercept + pm.math.dot(beta, cv) + subject_effects[subs[usemask]]))
-            # observations
-            observed = pm.Bernoulli("bernoulli_obs", p, observed=obs)
-            approx = pm.fit(method='advi', progressbar=False, callbacks=[])
-            trace_full = approx.sample(1000)
-            trueresults.append([i, j, trace_full])
-            
-
-        # fit null models
-        for nmi in range(n_nulls):
-            print(f"link {j}->{i} running null model {nmi}")
-            covar_null = covar.copy().reshape(n_subs, -1)
-            np.random.seed(nmi)
-            np.random.shuffle(covar_null)
-            covar_null = covar_null.flatten()
-            cvn = covar_null[usemask]
-            
-            with pm.Model() as nullmodel:
-                # model fixed effects priors
-                beta = pm.Normal('covar', mu=0, sigma=1)
-                intercept = pm.Normal('intercept', mu=0, sigma=10)
-
-                p = pm.Deterministic("p", pm.math.invlogit(intercept + pm.math.dot(beta, cvn) + subject_effects[subs[usemask]]))
-                observed = pm.Bernoulli("bernoulli_obs", p, observed=obs)
-
-                approx = pm.fit(method='advi', progressbar=False, callbacks=[])
-                trace_null = approx.sample(1000)
-                if posteriormode == 'fullposterior':
-                    nullresults.append([i, j, trace_null.posterior['covar'].values])
-                else:
-                    # mean of every trace
-                    nullresults.append([i, j, trace_null.posterior['covar'].values.mean()])
+        # extend data and overwrite dummy vars
+        pm.set_data({"cv_data": new_cv,
+                    "sub_idx": new_subs,
+                    "obs_data": new_obs})
         
-    return trueresults, nullresults
+        # fixed effects parameters
+        intercept = pm.Normal("intercept", mu=0, sigma=5)                 
+        beta = pm.Normal('beta', 0, 1, shape=(1))
 
+        # random effects (1|subject)
+        sigma_sub = pm.HalfNormal("subject_re_sigma", sigma=2.5)
+        subject_offset = pm.Normal("subject_offset", mu=0, sigma=0.5, shape=pm.math.max(subs_data) + 1)
+        subject_offset_extended = pm.Normal("subject_offset_extended", mu=0, sigma=sigma_offset_hat, shape=N_new_subs)
+        subject_effects = pm.Deterministic("RE", pm.math.concatenate([subject_offset, subject_offset_extended]) * sigma_sub)
 
-def simple_worker_negbin(chunk):
-    print(f"running full negbin model process {os.getpid()}")
-    if len(chunk) == 0:
-        return None
-    
-    subs = chunk[0][-3]
-    usemask = chunk[0][-2]
-    posteriormode = chunk[0][-1]
-    if posteriormode not in ["fullposterior", 'posteriormeans', 'trace']:
-        raise Exception(f"posterior mode {posteriormode} not supported")
-    
-    n_subs = len(np.unique(subs))
-    trueresults = []
-    nullresults = []
-    for i, j, data, covar, nullstartidx, nullblocksize, subs, usemask, posteriormode in chunk:
-        obs = data[usemask]
-        cv = covar[usemask]
-
-        # fit true model
-        with pm.Model() as truemodel:
-            sigma_sub = pm.HalfNormal("subject_re_sigma", sigma=10)
-            subject_offset = pm.Normal("subject_offset", mu=0, sigma=1, shape=n_subs)
-            subject_effects = pm.Deterministic("subject_effects", subject_offset * sigma_sub)
-            
-            # Priors for intercept and slope
-            alpha = pm.Normal("alpha", mu=0, sigma=5)
-            beta = pm.Normal("covar", mu=0, sigma=5)
-            
-            # Linear predictor
-            mu = pm.math.exp(alpha + beta * cv + subject_effects[subs[usemask]])
-            
-            # Likelihood
-            alpha_disp = pm.HalfNormal("alpha_disp", sigma=5)
-            y_obs = pm.NegativeBinomial("y_obs", mu=mu, alpha=alpha_disp, observed=obs)
-
-            # Sampling
-            tracetrue = pm.sample(1000, chains=4, return_inferencedata=True, 
-                                target_accept=0.95, cores=1, idata_kwargs={"log_likelihood": True}, 
-                                progressbar=False)
-            rhat = az.rhat(tracetrue)['covar'].values.flatten()[0]
-            trueresults.append([i, j, 0, rhat, tracetrue])
-
-        # fit null models
-        for nmi in range(nullstartidx, nullstartidx+nullblocksize):
-            print(f"link {j}->{i} running null model {nmi}")
-            covar_null = covar.copy().reshape(n_subs, -1)
-            np.random.seed(nmi)
-            np.random.shuffle(covar_null)
-            covar_null = covar_null.flatten()
-            cvn = covar_null[usemask]
-            
-            with pm.Model() as nullmodel:
-                sigma_sub = pm.HalfNormal("subject_re_sigma", sigma=10)
-                subject_offset = pm.Normal("subject_offset", mu=0, sigma=1, shape=n_subs)
-                subject_effects = pm.Deterministic("subject_effects", subject_offset * sigma_sub)
+        # linear predictor
+        eta_fixed = (cv_data @ beta)   # fixed effects
+        eta = intercept + eta_fixed + exposure + subject_effects[subs_data]
                 
-                # Priors for intercept and slope
-                alpha = pm.Normal("alpha", mu=0, sigma=5)
-                beta = pm.Normal("covar", mu=0, sigma=5)
-                
-                # Linear predictor
-                mu = pm.math.exp(alpha + beta * cvn + subject_effects[subs[usemask]])
+        mu  = pm.Deterministic('mu', pm.math.exp(eta))
+        psi = pm.Beta("psi", 1, 1)
 
-                # Likelihood
-                alpha_disp = pm.HalfNormal("alpha_disp", sigma=5)
-                y_obs = pm.NegativeBinomial("y_obs", mu=mu, alpha=alpha_disp, observed=obs)
+        y_obs = pm.Poisson("y_obs", mu=mu, observed=obs_data)
 
-                # Sampling
-                tracenull = pm.sample(1000, chains=4, return_inferencedata=True, 
-                                    target_accept=0.95, cores=1, idata_kwargs={"log_likelihood": True}, 
-                                    progressbar=False)
-                rhat = az.rhat(tracenull)['covar'].values.flatten()[0]
-
-                if posteriormode == 'fullposterior':
-                    nullresults.append([i, j, nmi, rhat, tracenull.posterior['covar'].values])
-                elif posteriormode == 'trace':
-                    nullresults.append([i, j, nmi, rhat, tracenull])
-                else:
-                    # mean of every trace
-                    nullresults.append([i, j, nmi, rhat, tracenull.posterior['covar'].values.mean(axis=1)])
-        
-    return trueresults, nullresults
-
-def simple_worker_zip(chunk):
-    print(f"running full zip model process {os.getpid()}")
-    if len(chunk) == 0:
-        return None
+        # meaningless here but left for consistency
+        pm.Bernoulli("y_bernoulli", p=1 - psi, observed=(obs_data == 0) * 1.0) 
+                                        
+        postpred = pm.sample_posterior_predictive(idata)
     
-    subs = chunk[0][-3]
-    usemask = chunk[0][-2]
-    posteriormode = chunk[0][-1]
-    if posteriormode not in ["fullposterior", 'posteriormeans', 'trace']:
-        raise Exception(f"posterior mode {posteriormode} not supported")
-    
-    n_subs = len(np.unique(subs))
-    trueresults = []
-    nullresults = []
-    for i, j, data, covar, nullstartidx, nullblocksize, subs, usemask, posteriormode in chunk:
-        obs = data[usemask]
-        cv = covar[usemask]
-
-        # fit true model
-        with pm.Model() as truemodel:
-            sigma_sub = pm.HalfNormal("subject_re_sigma", sigma=10)
-            subject_offset = pm.Normal("subject_offset", mu=0, sigma=1, shape=n_subs)
-            subject_effects = pm.Deterministic("subject_effects", subject_offset * sigma_sub)
-            
-            # Priors for intercept and slope
-            alpha = pm.Normal("alpha", mu=0, sigma=5)
-            beta = pm.Normal("covar", mu=0, sigma=5)
-            
-            # Linear predictor
-            mu = pm.math.exp(alpha + beta * cv + subject_effects[subs[usemask]])
-            
-            # Likelihood
-            psi = pm.Beta("psi", 1, 1)
-            y_obs = pm.ZeroInflatedPoisson("y_obs", mu=mu, psi=psi, observed=obs)
-
-            # Sampling
-            tracetrue = pm.sample(1000, chains=4, return_inferencedata=True, 
-                                target_accept=0.95, cores=1, idata_kwargs={"log_likelihood": True}, 
-                                progressbar=False)
-            rhat = az.rhat(tracetrue)['covar'].values.flatten()[0]
-            trueresults.append([i, j, 0, rhat, tracetrue])
-
-        # fit null models
-        for nmi in range(nullstartidx, nullstartidx+nullblocksize):
-            print(f"link {j}->{i} running null model {nmi}")
-            covar_null = covar.copy().reshape(n_subs, -1)
-            np.random.seed(nmi)
-            np.random.shuffle(covar_null)
-            covar_null = covar_null.flatten()
-            cvn = covar_null[usemask]
-            
-            with pm.Model() as nullmodel:
-                sigma_sub = pm.HalfNormal("subject_re_sigma", sigma=10)
-                subject_offset = pm.Normal("subject_offset", mu=0, sigma=1, shape=n_subs)
-                subject_effects = pm.Deterministic("subject_effects", subject_offset * sigma_sub)
-                
-                # Priors for intercept and slope
-                alpha = pm.Normal("alpha", mu=0, sigma=5)
-                beta = pm.Normal("covar", mu=0, sigma=5)
-                
-                # Linear predictor
-                mu = pm.math.exp(alpha + beta * cvn + subject_effects[subs[usemask]])
-
-                # Likelihood
-                psi = pm.Beta("psi", 1, 1)
-                y_obs = pm.ZeroInflatedPoisson("y_obs", mu=mu, psi=psi, observed=obs)
-
-                # Sampling
-                tracenull = pm.sample(1000, chains=4, return_inferencedata=True, 
-                                    target_accept=0.95, cores=1, idata_kwargs={"log_likelihood": True}, 
-                                    progressbar=False)
-                rhat = az.rhat(tracenull)['covar'].values.flatten()[0]
-                if posteriormode == 'fullposterior':
-                    nullresults.append([i, j, nmi, rhat, tracenull.posterior['covar'].values])
-                elif posteriormode == 'trace':
-                    nullresults.append([i, j, nmi, rhat, tracenull])
-                else:
-                    # mean of every trace
-                    nullresults.append([i, j, nmi, rhat, tracenull.posterior['covar'].values.mean(axis=1)])
-        
-    return trueresults, nullresults
+    return postpred, fullmodel_extended, new_cv, new_subs
 
 
-def simple_worker_zip_residualized(chunk):
-    print(f"running full zip two-stage model process {os.getpid()}")
-    if len(chunk) == 0:
-        return None
-    
-    subs = chunk[0][-3]
-    usemask = chunk[0][-2]
-    posteriormode = chunk[0][-1]
-    if posteriormode not in ["fullposterior", 'posteriormeans', 'trace']:
-        raise Exception(f"posterior mode {posteriormode} not supported")
-    
-    n_subs = len(np.unique(subs))
-    trueresults = []
-    nullresults = []
-    for i, j, data, covar, nullstartidx, nullblocksize, subs, usemask, posteriormode in chunk:
-        obs = data[usemask]
-        cv = covar[usemask]
-
-        with pm.Model() as zmodel:
-            sigma_sub = pm.HalfNormal("sigma_sub", sigma=10)
-            subject_offset = pm.Normal("subject_offset", mu=0, sigma=1, shape=n_subs)
-            subject_effects = pm.Deterministic("subject_effects", subject_offset * sigma_sub)
-            
-            alpha = pm.Normal("alpha", mu=0, sigma=5)
-            
-            eta = alpha + subject_effects[subs[usemask]] # only random effects
-            mu = pm.Deterministic("mu", pm.math.exp(eta))
-
-            psi = pm.Beta("psi", alpha=1, beta=1)
-            
-            y_obs = pm.ZeroInflatedPoisson("y_obs", mu=mu, psi=psi, observed=obs)
-            z_trace = pm.sample(1000, chains=4, return_inferencedata=True, 
-                                    target_accept=0.95, cores=1, idata_kwargs={"log_likelihood": True}, 
-                                    progressbar=False)
-
-        mu_hat = z_trace.posterior["mu"].mean(dim=("chain", "draw")).values
-        psi_hat = z_trace.posterior["psi"].mean().item()
-        y_hat = (1 - psi_hat) * mu_hat
-        residuals = obs - y_hat
-        
-        with pm.Model() as truemodel:
-            beta = pm.Normal("covar", mu=0, sigma=5)
-            mu = beta * cv
-            sigma = pm.HalfNormal("sigma", sigma=1)
-            y_obs = pm.Normal("y_obs", mu=mu, sigma=sigma, observed=residuals)
-            tracetrue = pm.sample(1000, chains=4, return_inferencedata=True, 
-                                    target_accept=0.95, cores=1, idata_kwargs={"log_likelihood": True}, 
-                                    progressbar=False)
-            rhat = az.rhat(tracetrue)['covar'].values.flatten()[0]
-            trueresults.append([i, j, 0, rhat, tracetrue])
-
-        for nmi in range(nullstartidx, nullstartidx+nullblocksize):
-            print(f"link {j}->{i} running null model {nmi}")
-            covar_null = covar.copy().reshape(n_subs, -1)
-            np.random.seed(nmi)
-            np.random.shuffle(covar_null)
-            covar_null = covar_null.flatten()
-            cvn = covar_null[usemask]
-
-            with pm.Model() as nullmodel:
-                beta = pm.Normal("covar", mu=0, sigma=5)
-                mu = beta * cvn
-                sigma = pm.HalfNormal("sigma", sigma=1)
-                y_obs = pm.Normal("y_obs", mu=mu, sigma=sigma, observed=residuals)
-                # Sampling
-                tracenull = pm.sample(1000, chains=4, return_inferencedata=True, 
-                                    target_accept=0.95, cores=1, idata_kwargs={"log_likelihood": True}, 
-                                    progressbar=False)
-                rhat = az.rhat(tracenull)['covar'].values.flatten()[0]
-                if posteriormode == 'fullposterior':
-                    nullresults.append([i, j, nmi, rhat, tracenull.posterior['covar'].values])
-                elif posteriormode == 'trace':
-                    nullresults.append([i, j, nmi, rhat, tracenull])
-                else:
-                    # mean of every trace
-                    nullresults.append([i, j, nmi, rhat, tracenull.posterior['covar'].values.mean(axis=1)])
-        print("done")
-        return trueresults, nullresults
-
-def simple_worker_zip_twostage(chunk):
-    print(f"running full zip model process {os.getpid()}")
-    if len(chunk) == 0:
-        return None
-    
-    subs = chunk[0][-3]
-    usemask = chunk[0][-2]
-    posteriormode = chunk[0][-1]
-    if posteriormode not in ["fullposterior", 'posteriormeans', 'trace']:
-        raise Exception(f"posterior mode {posteriormode} not supported")
-    
-    n_subs = len(np.unique(subs))
-    trueresults = []
-    nullresults = []
-    for i, j, data, covar, nullstartidx, nullblocksize, subs, usemask, posteriormode in chunk:
-        obs = data[usemask]
-        cv = covar[usemask]
-
-        # first stage: fit reduced model to derive random effects
-        # with pm.Model() as reffmodel:
-        #     sigma_sub = pm.HalfNormal("subject_re_sigma", sigma=10)
-        #     subject_offset = pm.Normal("subject_offset", mu=0, sigma=1, shape=n_subs)
-        #     subject_effects = pm.Deterministic("subject_effects", subject_offset * sigma_sub)
-            
-        #     # Priors for intercept and slope
-        #     alpha = pm.Normal("alpha", mu=0, sigma=5)
-            
-        #     # Linear predictor
-        #     mu = pm.math.exp(alpha + subject_effects[subs[usemask]])
-            
-        #     # Likelihood
-        #     psi = pm.Beta("psi", 1, 1)
-        #     y_obs = pm.ZeroInflatedPoisson("y_obs", mu=mu, psi=psi, observed=obs)
-
-        #     # Sampling
-        #     tracereff = pm.sample(1000, chains=4, return_inferencedata=True, 
-        #                         target_accept=0.95, cores=1, idata_kwargs={"log_likelihood": True}, 
-        #                         progressbar=False)
-        
-        # subject_effects_mean = tracereff.posterior["subject_effects"].mean(dim=("chain", "draw")).values
-        # print(subject_effects_mean.shape)
-        # alpha_mean = tracereff.posterior["alpha"].mean().item()
-        # offset_vals = alpha_mean + subject_effects_mean[subs[usemask]]
-
-        # second stage: fit true model using random effects posterior means
-        with pm.Model() as truemodel:
-            sigma_sub = pm.HalfNormal("subject_re_sigma", sigma=10)
-            subject_offset = pm.Normal("subject_offset", mu=0, sigma=1, shape=n_subs)
-            subject_effects = pm.Deterministic("subject_effects", subject_offset * sigma_sub)
-            
-            # Priors for intercept and slope
-            alpha = pm.Normal("alpha", mu=0, sigma=5)
-            beta = pm.Normal("covar", mu=0, sigma=5)
-            
-            # Linear predictor
-            mu = pm.math.exp(alpha + beta * cv + subject_effects[subs[usemask]])
-            
-            # Likelihood
-            psi = pm.Beta("psi", 1, 1)
-            y_obs = pm.ZeroInflatedPoisson("y_obs", mu=mu, psi=psi, observed=obs)
-
-            # Sampling
-            tracetrue = pm.sample(1000, chains=4, return_inferencedata=True, 
-                                target_accept=0.95, cores=1, idata_kwargs={"log_likelihood": True}, 
-                                progressbar=False)
-            rhat = az.rhat(tracetrue)['covar'].values.flatten()[0]
-            trueresults.append([i, j, 0, rhat, tracetrue])
-
-        subject_effects_mean = tracetrue.posterior["subject_effects"].mean(dim=("chain", "draw")).values
-        alpha_mean = tracetrue.posterior["alpha"].mean().item()
-        offset_vals = alpha_mean + subject_effects_mean[subs[usemask]]
-
-        # second stage: fit null models using random effects posterior means
-        for nmi in range(nullstartidx, nullstartidx+nullblocksize):
-            print(f"link {j}->{i} running null model {nmi}")
-            covar_null = covar.copy().reshape(n_subs, -1)
-            np.random.seed(nmi)
-            np.random.shuffle(covar_null)
-            covar_null = covar_null.flatten()
-            cvn = covar_null[usemask]
-            
-            with pm.Model() as nullmodel:
-                beta = pm.Normal("covar", mu=0, sigma=5)
-                
-                # Linear predictor
-                mu = pm.math.exp(beta * cvn + offset_vals)
-
-                # Likelihood
-                psi = pm.Beta("psi", 1, 1)
-                y_obs = pm.ZeroInflatedPoisson("y_obs", mu=mu, psi=psi, observed=obs)
-
-                # Sampling
-                tracenull = pm.sample(1000, chains=4, return_inferencedata=True, 
-                                    target_accept=0.95, cores=1, idata_kwargs={"log_likelihood": True}, 
-                                    progressbar=False)
-                rhat = az.rhat(tracenull)['covar'].values.flatten()[0]
-                if posteriormode == 'fullposterior':
-                    nullresults.append([i, j, nmi, rhat, tracenull.posterior['covar'].values])
-                elif posteriormode == 'trace':
-                    nullresults.append([i, j, nmi, rhat, tracenull])
-                else:
-                    # mean of every trace
-                    nullresults.append([i, j, nmi, rhat, tracenull.posterior['covar'].values.mean(axis=1)])
-        
-    return trueresults, nullresults
-
-
-def simple_worker_zip_reduced_full(chunk):
-    print(f"running zip models process {os.getpid()}")
-    if len(chunk) == 0:
-        return None
-    
-    subs = chunk[0][-3]
-    usemask = chunk[0][-2]
-    posteriormode = chunk[0][-1]
-    if posteriormode not in ["fullposterior", 'posteriormeans', 'trace']:
-        raise Exception(f"posterior mode {posteriormode} not supported")
-    
-    n_subs = len(np.unique(subs))
-    trueresults = []
-    nullresults = []
-    for i, j, data, covar, nullstartidx, nullblocksize, subs, usemask, posteriormode in chunk:
-        obs = data[usemask]
-        cv = covar[usemask]
-
-
-        # first stage: fit reduced model using only random effects
-        with pm.Model() as reducedmodel:
-            print(f"link {j}->{i} running reduced model")
-            sigma_sub = pm.HalfNormal("subject_re_sigma", sigma=10)
-            subject_offset = pm.Normal("subject_offset", mu=0, sigma=1, shape=n_subs)
-            subject_effects = pm.Deterministic("subject_effects", subject_offset * sigma_sub)
-            
-            # Priors for intercept and slope
-            alpha = pm.Normal("alpha", mu=0, sigma=5)
-            
-            # Linear predictor
-            mu = pm.math.exp(alpha + subject_effects[subs[usemask]])
-            
-            # Likelihood
-            psi = pm.Beta("psi", 1, 1)
-            y_obs = pm.ZeroInflatedPoisson("y_obs", mu=mu, psi=psi, observed=obs)
-
-            # Sampling
-            tracereduced = pm.sample(1000, chains=4, return_inferencedata=True, 
-                                target_accept=0.95, cores=1, idata_kwargs={"log_likelihood": True}, 
-                                progressbar=False)
-
-            postpred = pm.sample_posterior_predictive(tracereduced, random_seed=0)
-
-        artificial_data = postpred['posterior_predictive'].y_obs.values.reshape(-1, len(obs))
-        
-        # fit one full model to the true data. this is only done separately to conform to the return value api
-        # ideally it should be included in the block below since the model is exactly the same and only the 
-        # data are changed (from true observations to artificial data from posterior predictions)
-        with pm.Model() as fullmodel_true:
-            print(f"link {j}->{i} running full true model")
-            sigma_sub = pm.HalfNormal("subject_re_sigma", sigma=10)
-            subject_offset = pm.Normal("subject_offset", mu=0, sigma=1, shape=n_subs)
-            subject_effects = pm.Deterministic("subject_effects", subject_offset * sigma_sub)
-            
-            # Priors for intercept and slope
-            alpha = pm.Normal("alpha", mu=0, sigma=5)
-            beta = pm.Normal("covar", mu=0, sigma=0.5)
-            
-            # Linear predictor
-            mu = pm.math.exp(alpha + beta * cv + subject_effects[subs[usemask]])
-            
-            # Likelihood
-            psi = pm.Beta("psi", 1, 1)
-            y_obs = pm.ZeroInflatedPoisson("y_obs", mu=mu, psi=psi, observed=obs)
-
-            # Sampling
-            tracefulltrue = pm.sample(1000, chains=4, return_inferencedata=True, 
-                                target_accept=0.95, cores=1, idata_kwargs={"log_likelihood": True}, 
-                                progressbar=False)
-            rhat = az.rhat(tracefulltrue)['covar'].values.flatten()[0]
-            trueresults.append([i, j, 0, rhat, tracefulltrue])
-
-        # second stage: fit null models using random effects posterior means
-        for nmi in range(nullstartidx, nullstartidx+nullblocksize):
-            assert(nmi < artificial_data.shape[0])
-            print(f"link {j}->{i} running full null model {nmi}")
-            artificial_obs = artificial_data[nmi]
-            with pm.Model() as fullmodel_null:
-                sigma_sub = pm.HalfNormal("subject_re_sigma", sigma=10)
-                subject_offset = pm.Normal("subject_offset", mu=0, sigma=1, shape=n_subs)
-                subject_effects = pm.Deterministic("subject_effects", subject_offset * sigma_sub)
-                
-                # Priors for intercept and slope
-                alpha = pm.Normal("alpha", mu=0, sigma=5)
-                beta = pm.Normal("covar", mu=0, sigma=0.5)
-                
-                # Linear predictor
-                mu = pm.math.exp(alpha + beta * cv + subject_effects[subs[usemask]])
-
-                # Likelihood
-                psi = pm.Beta("psi", 1, 1)
-                y_obs = pm.ZeroInflatedPoisson("y_obs", mu=mu, psi=psi, observed=artificial_obs)
-
-                # Sampling
-                tracefullppc = pm.sample(1000, chains=4, return_inferencedata=True, 
-                                    target_accept=0.95, cores=1, idata_kwargs={"log_likelihood": True}, 
-                                    progressbar=False)
-                rhat = az.rhat(tracefullppc)['covar'].values.flatten()[0]
-                if posteriormode == 'fullposterior':
-                    nullresults.append([i, j, nmi, rhat, tracefullppc.posterior['covar'].values])
-                elif posteriormode == 'trace':
-                    nullresults.append([i, j, nmi, rhat, tracefullppc])
-                else:
-                    # mean of every trace
-                    nullresults.append([i, j, nmi, rhat, tracefullppc.posterior['covar'].values.mean(axis=1)])
-        
-    return trueresults, nullresults
-
-def integrated_worker_zi_reduced_full(chunk):
-    import pymc_extras as pmx    
-
-    print(f"running integrated zi models process {os.getpid()}")
-    _supported_models = ["zinegbin", "zip", "zigenpois"]
+def power_analysis(chunk):
+    print(f"running power analysis ztp models process {os.getpid()}")
     if len(chunk) == 0:
         return None
     
     S = chunk[0][-3]
     usemask = chunk[0][-2]
     mode = chunk[0][-1]
-    
+    samplesizes = mode['samplesizes']
+    N_trials = mode['n_trials']
     n_subs = len(np.unique(S))
+
     trueresults = []
-    nullresults = []
-    for i, j, data, covar, design, nullstartidx, nullblocksize, S, usemask, mode in chunk:
-        nullmode = mode["nullmode"]
-        reducedmode = mode["reducedmode"]
-        modeltype = mode['modeltype']
-        if not modeltype in _supported_models:
-            raise Exception(f"model type {modeltype} not one of {_supported_models}")
+    simtrueresults = {i:[] for i in samplesizes}
+    simnullresults = {i:[] for i in samplesizes}
+    infos = {i:[] for i in samplesizes}
+
+    for i, j, data, X, Z, nullstartidx, nullblocksize, S, usemask, mode in chunk:
+        exposure = mode['exposure']
+        samplemode = mode['samplemode']
         obs = data[usemask]
-        cv = covar[usemask]
-        if cv.shape != covar.shape:
-            raise Exception("usemask not supported. covariate must already be shaped to observations. do not impute values.")
-        
-        # first stage: fit reduced model using only random effects
-        with pm.Model() as reducedmodel:
-            # fixed effects: 6 cell means on log scale 
-            # order: [Yq, Y0, Y6, Oq, O0, O6]
+        cv = X[usemask]
+        subs = S[usemask]
+        design = Z[usemask]
 
-            # random effects (1 + condition | subject) 
-#             sd = pm.HalfNormal.dist(1.0, shape=3)
-#             chol, _, _ = pm.LKJCholeskyCov('chol', n=3, eta=2.0, sd_dist=sd)
-#             re_raw = pm.Normal('re_raw', 0, 1, shape=(n_subs,3))
-#             RE = pm.Deterministic('RE', re_raw @ chol.T)
-#             b0  = RE[S, 0]            # random intercept
-#             bM  = RE[S, 1]            # random slope for 0dB (vs quiet)
-#             bH  = RE[S, 2]            # random slope for -6dB (vs quiet)
+        cv = cv[obs > 0, 1:]
+        subs = subs[obs > 0]
+        obs_nonzero = obs[obs > 0]
 
-            sigma_sub = pm.HalfNormal("subject_re_sigma", sigma=10)
-            subject_offset = pm.Normal("subject_offset", mu=0, sigma=1, shape=n_subs)
-            RE = pm.Deterministic("subject_effects", subject_offset * sigma_sub)
-            b0 = RE[S]
+        # first fit on pilot data only
+        # always use nuts sampler to generate first-pass at effects
+        pilotmodeltrace, _, _, _ = fit_fullmodel(obs, obs_nonzero, cv, subs, 
+                                                 exposure, 'nuts')
 
-            # linear predictor
-            if reducedmode == 'omnibus':
-                beta = pm.Normal('beta', 0, 1)
-                eta_fixed = beta                  # population mean
-            elif reducedmode == 'ageonly':
-                beta = pm.Normal('beta', 0, 1, shape=2)
-                X = cv.reshape(-1, 2, 3).max(axis=2) 
-                eta_fixed = (X @ beta)      
-            elif reducedmode == 'conditiononly':
-                beta = pm.Normal('beta', 0, 1, shape=3)
-                X = cv.reshape(-1, 2, 3).max(axis=1) 
-                eta_fixed = (X @ beta)    
-            else:
-                raise Exception(f"reduced mode {nullmode} not supported")
-                
-            eta = eta_fixed + b0 # + bM*design[:,0] + bH*design[:,1]
-            mu  = pm.Deterministic('mu', pm.math.exp(eta))
-
-            # zero inflation (global psi) 
-            alpha_psi = pm.Normal('alpha_psi', 0, 1)
-            psi  = pm.Deterministic('psi', pm.math.sigmoid(alpha_psi))
-
-            # likelihood 
-            if modeltype == 'zip':
-                pm.ZeroInflatedPoisson('y_obs', psi=psi, mu=mu, observed=obs)
-            if modeltype == 'zinegbin':
-                alpha_disp = pm.HalfNormal("alpha_disp", sigma=5)
-                pm.ZeroInflatedNegativeBinomial('y_obs', psi=psi, mu=mu, alpha=alpha_disp, observed=obs)
-            if modeltype == 'genpois':
-                lower = pm.math.maximum(-1.0, -mu / 4.0)
-                # fraction between lower and 1
-                lam_rel = pm.Beta("lam_rel", 2, 2)
-                lam = pm.Deterministic("lam", lower + lam_rel * (1.0 - lower))
-                pmx.distributions.GeneralizedPoisson('y_obs', mu=mu, lam=lam, observed=obs)
-            if modeltype == 'zigenpois':
-                lower = pm.math.maximum(-1.0, -mu / 4.0)
-                # fraction between lower and 1
-                lam_rel = pm.Beta("lam_rel", 2, 2)
-                lam = pm.Deterministic("lam", lower + lam_rel * (1.0 - lower))
-                zero_component = pm.DiracDelta.dist(0)
-                gp_component  = pmx.distributions.GeneralizedPoisson.dist(mu=mu, lam=lam)
-                y_obs = pm.Mixture(
-                    "y_obs",
-                    w=[psi, 1 - psi],
-                    comp_dists=[zero_component, gp_component],
-                    observed=obs,  
-                )
-
-
-            # sampling
-            tracereduced = pm.sample(4000, chains=4, return_inferencedata=True, 
-                                target_accept=0.95, cores=1, idata_kwargs={"log_likelihood": True}, 
-                                progressbar=False)
-
-            postpred = pm.sample_posterior_predictive(tracereduced, random_seed=0)
-
-        artificial_data = postpred['posterior_predictive'].y_obs.values.reshape(-1, len(obs))
-        
-        # fit one full model to the true data. this is only done separately to conform to the return value api
-        # ideally it should be included in the block below since the model is exactly the same and only the 
-        # data are changed (from true observations to artificial data from posterior predictions)
-        with pm.Model() as fullmodel_true:
-            # fixed effects: 6 cell means on log scale 
-            # order: [Yq, Y0, Y6, Oq, O0, O6]
-            beta = pm.Normal('beta', 0, 1, shape=6)
-
-            # random effects (1 + condition | subject) 
-            sd = pm.HalfNormal.dist(1.0, shape=3)
-            chol, _, _ = pm.LKJCholeskyCov('chol', n=3, eta=2.0, sd_dist=sd)
-            re_raw = pm.Normal('re_raw', 0, 1, shape=(n_subs,3))
-            RE = pm.Deterministic('RE', re_raw @ chol.T)
-            b0  = RE[S, 0]            # random intercept
-            bM  = RE[S, 1]            # random slope for 0dB (vs quiet)
-            bH  = RE[S, 2]            # random slope for -6dB (vs quiet)
-
-            # linear predictor
-            eta_fixed = (cv @ beta)                      # pick the appropriate cell mean
-            eta = eta_fixed + b0 + bM*design[:,0] + bH*design[:,1]
-            mu  = pm.Deterministic('mu', pm.math.exp(eta))
-
-            # zero inflation (global psi) 
-            alpha_psi = pm.Normal('alpha_psi', 0, 1)
-            psi  = pm.Deterministic('psi', pm.math.sigmoid(alpha_psi))
-
-            # likelihood 
-            if modeltype == 'zip':
-                pm.ZeroInflatedPoisson('y_obs', psi=psi, mu=mu, observed=obs)
-            if modeltype == 'zinegbin':
-                alpha_disp = pm.HalfNormal("alpha_disp", sigma=5)
-                pm.ZeroInflatedNegativeBinomial('y_obs', psi=psi, mu=mu, alpha=alpha_disp, observed=obs)
-            if modeltype == 'genpois':
-                lower = pm.math.maximum(-1.0, -mu / 4.0)
-                # fraction between lower and 1
-                lam_rel = pm.Beta("lam_rel", 2, 2)
-                lam = pm.Deterministic("lam", lower + lam_rel * (1.0 - lower))
-                pmx.distributions.GeneralizedPoisson('y_obs', mu=mu, lam=lam, observed=obs)
-            if modeltype == 'zigenpois':
-                lower = pm.math.maximum(-1.0, -mu / 4.0)
-                # fraction between lower and 1
-                lam_rel = pm.Beta("lam_rel", 2, 2)
-                lam = pm.Deterministic("lam", lower + lam_rel * (1.0 - lower))
-                zero_component = pm.DiracDelta.dist(0)
-                gp_component  = pmx.distributions.GeneralizedPoisson.dist(mu=mu, lam=lam)
-                y_obs = pm.Mixture(
-                    "y_obs",
-                    w=[psi, 1 - psi],
-                    comp_dists=[zero_component, gp_component],
-                    observed=obs,  
-                )
-
-            # sampling
-            tracefulltrue = pm.sample(4000, chains=4, return_inferencedata=True, 
-                                target_accept=0.95, cores=1, idata_kwargs={"log_likelihood": True}, 
-                                progressbar=False)
-            rhat = None # unsupported
-            trueresults.append([i, j, 0, rhat, tracefulltrue.posterior['beta'].values.mean(axis=1)])
-
-        # second stage: fit null models using random effects posterior means
-        for nmi in range(nullstartidx, nullstartidx+nullblocksize):
-            assert(nmi < artificial_data.shape[0])
-            print(f"link {j}->{i} running full null model {nmi}, {modeltype}")
-            artificial_obs = artificial_data[nmi]
-            with pm.Model() as fullmodel_null:
-                # fixed effects: 6 cell means on log scale 
-                # order: [Yq, Y0, Y6, Oq, O0, O6]
-                beta = pm.Normal('beta', 0, 1, shape=6)
-
-                # random effects (1 + condition | subject) 
-                sd = pm.HalfNormal.dist(1.0, shape=3)
-                chol, _, _ = pm.LKJCholeskyCov('chol', n=3, eta=2.0, sd_dist=sd)
-                re_raw = pm.Normal('re_raw', 0, 1, shape=(n_subs,3))
-                RE = pm.Deterministic('RE', re_raw @ chol.T)
-                b0  = RE[S, 0]            # random intercept
-                bM  = RE[S, 1]            # random slope for 0dB (vs quiet)
-                bH  = RE[S, 2]            # random slope for -6dB (vs quiet)
-
-                # linear predictor
-                eta_fixed = (cv @ beta)                      # pick the appropriate cell mean
-                eta = eta_fixed + b0 + bM*design[:,0] + bH*design[:,1]
-                mu  = pm.Deterministic('mu', pm.math.exp(eta))
-
-                # zero inflation (global psi) 
-                alpha_psi = pm.Normal('alpha_psi', 0, 1)
-                psi  = pm.Deterministic('psi', pm.math.sigmoid(alpha_psi))
-
-                # likelihood 
-                if modeltype == 'zip':
-                    pm.ZeroInflatedPoisson('y_obs', psi=psi, mu=mu, observed=artificial_obs)
-                if modeltype == 'zinegbin':
-                    alpha_disp = pm.HalfNormal("alpha_disp", sigma=5)
-                    pm.ZeroInflatedNegativeBinomial('y_obs', psi=psi, mu=mu, alpha=alpha_disp, observed=artificial_obs)
-                if modeltype == 'genpois':
-                    lower = pm.math.maximum(-1.0, -mu / 4.0)
-                    # fraction between lower and 1
-                    lam_rel = pm.Beta("lam_rel", 2, 2)
-                    lam = pm.Deterministic("lam", lower + lam_rel * (1.0 - lower))
-                    pmx.distributions.GeneralizedPoisson('y_obs', mu=mu, lam=lam, observed=artificial_obs)
-                if modeltype == 'zigenpois':
-                    lower = pm.math.maximum(-1.0, -mu / 4.0)
-                    # fraction between lower and 1
-                    lam_rel = pm.Beta("lam_rel", 2, 2)
-                    lam = pm.Deterministic("lam", lower + lam_rel * (1.0 - lower))
-                    zero_component = pm.DiracDelta.dist(0)
-                    gp_component  = pmx.distributions.GeneralizedPoisson.dist(mu=mu, lam=lam)
-                    y_obs = pm.Mixture(
-                        "y_obs",
-                        w=[psi, 1 - psi],
-                        comp_dists=[zero_component, gp_component],
-                        observed=artificial_obs,  
-                    )
-
-                # sampling
-                if nullmode == 'advi':
-                    try:
-                        approx = pm.fit(method='advi', progressbar=False, callbacks=[])
-                        tracefullnull = approx.sample(1000)
-                    except FloatingPointError as e:
-                        print(f"null model {nmi} for link {i}->{j} failed due to floating point error: {e}")
-                        nullresults.append([i, j, nmi, None, np.nan*np.zeros((1, 6))])
-                        continue
-                elif nullmode == 'nuts':
-                    tracefullnull = pm.sample(4000, chains=4, return_inferencedata=True, 
-                                        target_accept=0.95, cores=1, idata_kwargs={"log_likelihood": True}, 
-                                        progressbar=False)
-                else:
-                    raise Exception(f"null mode {nullmode} not supported")
-                rhat = None # unsupported
-                nullresults.append([i, j, nmi, rhat, tracefullnull.posterior['beta'].values.mean(axis=1)])
-        
-    return trueresults, nullresults
-
-
-def simple_worker_zigenpois_interceptonly(chunk):
-    import pymc_extras as pmx    
-    print(f"running zip models process {os.getpid()}")
-    if len(chunk) == 0:
-        return None
-    
-    subs = chunk[0][-3]
-    usemask = chunk[0][-2]
-    posteriormode = chunk[0][-1]
-    # if posteriormode not in ["fullposterior", 'posteriormeans', 'trace']:
-    #     raise Exception(f"posterior mode {posteriormode} not supported")
-    
-    n_subs = len(np.unique(subs))
-    trueresults = []
-    # nullresults = []
-    for i, j, data, covar, nullstartidx, nullblocksize, subs, usemask, posteriormode in chunk:
-        obs = data[usemask]
-        cv = covar[usemask]
-        
-        # fit one full model to the true data. this is only done separately to conform to the return value api
-        # ideally it should be included in the block below since the model is exactly the same and only the 
-        # data are changed (from true observations to artificial data from posterior predictions)
-        with pm.Model() as fullmodel_true:
-            print(f"link {j}->{i} running full true model")
-            sigma_sub = pm.HalfNormal("subject_re_sigma", sigma=10)
-            subject_offset = pm.Normal("subject_offset", mu=0, sigma=1, shape=n_subs)
-            subject_effects = pm.Deterministic("subject_effects", subject_offset * sigma_sub)
+        for samplesize in samplesizes:
+            postpred, generative_model, extended_cv, extended_subs = \
+                generate_data(pilotmodeltrace, samplesize, 
+                              N_trials, obs_nonzero, cv, subs, exposure)
             
-            # Priors for intercept and slope
-            alpha = pm.Normal("alpha", mu=0, sigma=5)
-            # beta = pm.Normal("covar", mu=0, sigma=0.5)
-            
-            # Linear predictor
-            mu = pm.math.exp(alpha + subject_effects[subs[usemask]])
-            
-            # Likelihood
-            psi = pm.Beta("psi", 1, 1)
-            
-            lower = pm.math.maximum(-1.0, -mu / 4.0)
-            # fraction between lower and 1
-            lam_rel = pm.Beta("lam_rel", 2, 2)
-            lam = pm.Deterministic("lam", lower + lam_rel * (1.0 - lower))
-            zero_component = pm.DiracDelta.dist(0)
-            gp_component  = pmx.distributions.GeneralizedPoisson.dist(mu=mu, lam=lam)
-            y_obs = pm.Mixture(
-                "y_obs",
-                w=[psi, 1 - psi],
-                comp_dists=[zero_component, gp_component],
-                observed=obs,  
-            )
+            # artificial data containing weak beta fixed effect
+            artificial_data = postpred.posterior_predictive['y_obs'].values\
+                        .reshape(4 * 4000, -1) # (n_chain x n_samples, n_obs)
 
-            # Sampling
-            tracefulltrue = pm.sample(5000, chains=4, return_inferencedata=True, 
-                                target_accept=0.95, cores=1, idata_kwargs={"log_likelihood": True}, 
-                                progressbar=False)
-            rhat = az.rhat(tracefulltrue)['alpha'].values.flatten()[0]
-            trueresults.append([i, j, 0, rhat, tracefulltrue])
+            # need to make sure we don't (likely) fit one model per chain within
+            # each sample which would happen if we didn't shuffle the data (very
+            # unlikely now)
+            np.random.seed(0)
+            np.random.shuffle(artificial_data) # (n_chain x 4000, n_obs)
 
-    return trueresults, None
+            # clamp beta to 0 and generate another set of artificial data
+            with pm.do(generative_model, {"beta": [0.0]}) as m_do:
+                postpred_do = pm.sample_posterior_predictive(pilotmodeltrace, random_seed=0)
+
+            null_data = postpred_do.posterior_predictive['y_obs'].values.reshape(4 * 4000, -1) # (n_chain x n_samples, n_obs * 3)
+
+            # # need to make sure we don't (likely) fit one model per chain within each sample
+            # # which would happen if we didn't shuffle the data (very unlikely now)
+            np.random.seed(0)
+            np.random.shuffle(null_data) # (n_chain x 4000, n_obs)
+
+            # for this sample size we simulate N_sims fits on the aritificial
+            # data set
+            for simno in range(nullstartidx, nullstartidx+nullblocksize):
+                print(f"chunk {i}->{j}: samplesize={samplesize}, simno={simno}, truemodel")
+                sim_true_data = artificial_data[simno]
+                sim_true_data_nonzero = sim_true_data[sim_true_data > 0]
+                simtrace, simmodel, rhat, posterior_subsamples = \
+                                    fit_fullmodel(sim_true_data, 
+                                            sim_true_data_nonzero, 
+                                            extended_cv[sim_true_data > 0], 
+                                            extended_subs[sim_true_data > 0],
+                                            exposure, samplemode)
+
+                simtrueresults[samplesize].append([i, j, simno, rhat, posterior_subsamples])
+
+                print(f"chunk {i}->{j}: samplesize={samplesize}, simno={simno}, nullmodel")
+                sim_null_data = null_data[simno]
+                sim_null_data_nonzero = sim_null_data[sim_null_data > 0]
+                simtrace, simmodel, rhat, posterior_subsamples = \
+                                    fit_fullmodel(sim_null_data, 
+                                            sim_null_data_nonzero, 
+                                            extended_cv[sim_null_data > 0], 
+                                            extended_subs[sim_null_data > 0],
+                                            exposure, samplemode)
+
+                simnullresults[samplesize].append([i, j, simno, rhat, posterior_subsamples])
+
+                infos[samplesize].append([i, j, simno, extended_cv, extended_subs, sim_true_data, sim_null_data])
+
+    return simtrueresults, simnullresults, infos
 
 # +
-def simple_worker_zip_conditiononly(chunk):
-    import pymc_extras as pmx    
-
-    print(f"running integrated zip models process {os.getpid()}")
-    if len(chunk) == 0:
-        return None
+# def statvals(dfinput, interventions):
+#     dfinput = dfinput.copy()
+#     dfi_nonzero = dfinput[dfinput.connectivity > 0]
     
-    S = chunk[0][-3]
-    usemask = chunk[0][-2]
-    mode = chunk[0][-1]
-    
-    n_subs = len(np.unique(S))
-    trueresults = []
-    nullresults = []
-    for i, j, data, X, Z, nullstartidx, nullblocksize, S, usemask, mode in chunk:
-        nullmode = mode["nullmode"]
-        reducedmode = mode["reducedmode"]
-        nullppc = mode["nullppc"]
+# #     inputmeans = {var:None for var in interventions}
+# #     for var in interventions:
+# #         inputmeans[var] = dfinput.groupby(var, observed=True)['connectivity'].mean()
 
-        obs = data[usemask]
-        cv = X[usemask]
-        subs = S[usemask]
-        design = Z[usemask]
-        n_conditions = cv.shape[1]
+# #     inputstds = {var:None for var in interventions}
+# #     for var in interventions:
+# #         inputstds[var] = dfinput.groupby(var, observed=True)['connectivity'].var(ddof=1)
 
-        # first stage: fit true model
-        with pm.Model() as fullmodel_true:
-            # fixed effects parameters
-            intercept = pm.Normal("intercept", mu=0, sigma=10)                 # population baseline log-mean
-            beta = pm.Normal('beta', 0, 5, shape=(n_conditions-1))
-
-            # random effects (1 + condition | subject) 
-            sd = pm.HalfNormal.dist(1.0, shape=n_conditions)
-            chol, _, _ = pm.LKJCholeskyCov('chol', n=n_conditions, eta=2.0, sd_dist=sd)
-            re_raw = pm.Normal('re_raw', 0, 1, shape=(n_subs, n_conditions))
-            RE = pm.Deterministic('RE', re_raw @ chol.T)
-            bRE  = RE[subs, :]        # random effects (n_obs, n_conditions)
-
-#             sigma_sub = pm.HalfNormal("subject_re_sigma", sigma=10)
-#             subject_offset = pm.Normal("subject_offset", mu=0, sigma=1, shape=n_subs)
-#             subject_effects = pm.Deterministic("subject_effects", subject_offset * sigma_sub)
-
-            # linear predictor
-            # beta_intercept + ind(beta_0dB) + ind(beta_-6dB) + re_intercept + ind(re_0dB) + ind(re_-6dB)
-            eta_fixed = (cv[:, 1:] @ beta)   # fixed effects
-#             eta = eta_fixed + subject_effects[subs]#+ pm.math.sum(bRE * design, axis=1)
-            eta = intercept + eta_fixed + pm.math.sum(bRE * design, axis=1)
-
-            mu  = pm.Deterministic('mu', pm.math.exp(eta))
-
-            # likelihood zip
-            conditions = cv
-            conditions[:, 0] = (conditions[:, 1:].sum(axis=1) == 0).astype(int)
-            
-            # pooled per condition psis
-#             alpha_psi_mu = pm.Normal('alpha_psi_mu', 0., 1.)
-#             alpha_psi_sd = pm.HalfNormal('alpha_psi_sd', 1.)
-#             alpha_psi_offset = pm.Normal('alpha_psi_offset', 0., 1., shape=n_conditions)
-#             alpha_psi = pm.Deterministic('psi_latent', alpha_psi_mu + alpha_psi_offset * alpha_psi_sd)    # (n_conditions,)
-#             psi_cond = pm.Deterministic('psi', pm.math.sigmoid(conditions @ alpha_psi))
-            psi = pm.Beta("psi", 1, 1)
-            
-            y_obs = pm.ZeroInflatedPoisson("y_obs", mu=mu, psi=psi, observed=obs)
-
-            # see if sampler converges with obtaining invalid values
-            with warnings.catch_warnings():
-                warnings.simplefilter("error", RuntimeWarning)
-                
-                try:
-                    tracefulltrue = pm.sample(4000, chains=4, return_inferencedata=True, 
-                            target_accept=0.95, cores=1, idata_kwargs={"log_likelihood": True}, 
-                            progressbar=False)
-                    badconvflag = False
-            
-                except RuntimeWarning as e:
-                    print(f"true model {i}->{j} caught a RuntimeWarning exception:", e)
-                    badconvflag = True
-                
-            # here the sampler will raise a runtime warning but will still proceed with sampling
-            # this way we will still obtain estimates, just with the knowledge that something
-            # didn't go right
-            if badconvflag:
-                tracefulltrue = pm.sample(4000, chains=4, return_inferencedata=True, 
-                            target_accept=0.95, cores=1, idata_kwargs={"log_likelihood": True}, 
-                            progressbar=False)
-            
-            post = tracefulltrue.posterior
-            postpred = pm.sample_posterior_predictive(tracefulltrue, random_seed=0)
-            _intercept = post['intercept'].mean(dim=('chain', 'draw')).values
-            _mu = post['mu'].mean(dim=('chain', 'draw')).values
-            _psi = post['psi'].mean().item()
-            posterior_subsamples = {
-                "intercept": _intercept, 
-                "beta": post['beta'].mean(dim=('chain', 'draw')).values,
-                "RE": post["RE"].mean(dim=("chain", "draw")).values,
-                "mu": _mu,
-                "psi": _psi,
-                "obs": obs,
-                "predicted_samples": postpred,
-                "badconv": badconvflag,
-            }
-            rhat = None # az.rhat(tracefulltrue)
-            trueresults.append([i, j, 0, rhat, posterior_subsamples])
+#     inputsizes = {var:None for var in interventions}
+#     for var in interventions:
+#         inputsizes[var] = dfinput.groupby(var, observed=True).apply(lambda x: len(x), include_groups=False)
         
-        subject_effects_mean = post["RE"].mean(dim=('chain', 'draw')).values
-        offset_vals = subject_effects_mean[subs]
-        fixed_psi = _psi
-        fixed_intercept = post['intercept'].mean().item()
+#     nzinputmeans = {var:None for var in interventions}
+#     for var in interventions:
+#         nzinputmeans[var] = dfi_nonzero.groupby(var, observed=True).apply(lambda x: np.log(x['connectivity']).mean(), 
+#                                                                           include_groups=False)
 
-        # second stage: fit null models using random effects posterior means
-        for nmi in range(nullstartidx, nullstartidx+nullblocksize):
-            print(f"link {j}->{i} running permuted null model {nmi}")
-            cvshape = X.shape
-            usemaskshape = usemask.shape
+#     nzinputstds = {var:None for var in interventions}
+#     for var in interventions:
+#         nzinputstds[var] = dfi_nonzero.groupby(var, observed=True).apply(lambda x: np.log(x['connectivity']).var(ddof=1), 
+#                                                                          include_groups=False)
 
-            covar_null = X.copy().reshape(n_subs, -1)
-#             usemask_null = usemask.copy().reshape(n_subs, -1)
+#     nzinputsizes = {var:None for var in interventions}
+#     for var in interventions:
+#         nzinputsizes[var] = dfi_nonzero.groupby(var, observed=True).apply(lambda x: len(x), include_groups=False)
 
-            np.random.seed(nmi)
-            idxs = list(range(n_subs))
-            np.random.shuffle(idxs)
+#     return nzinputmeans, nzinputstds, nzinputsizes, inputsizes 
 
-            covar_null = covar_null[idxs]
-            covar_null = covar_null.reshape(*cvshape)
-#             usemask_null = usemask_null[idxs]
-#             usemask_null = usemask_null.reshape(*usemaskshape)
+# def general_worker(chunk):
+#     print(f"running general model process {os.getpid()}")
+#     compiledir = f"/export/vrishab/compile/{os.getpid()}"
+#     pathlib.Path(compiledir).mkdir(parents=True, exist_ok=True)
 
-            cvn = covar_null[usemask]
+#     os.environ["PYTENSOR_FLAGS"] = f"compiledir={compiledir}"
+    
+#     trueresults = []
+#     nullresults = []
+#     for i, j, data_full, formula, priors, interventions, nullstartidx, nullblocksize, nullmethod in chunk:
+#         assert isinstance(data_full, pd.DataFrame), "data object must be a pandas dataframe"
+#         assert "connectivity" in data_full.columns, "data must have connectivity as a column name"
+        
+#         data = data_full[data_full.connectivity > 0]
+#         data_zeros = data_full[data_full.connectivity == 0]
+        
+#         fullmodel_true = bmb.Model(formula, data, priors=priors, family='hurdle_lognormal')
+#         fullmodel_true.build()
+#         fullmodel_true = fullmodel_true.backend.model
 
-            with pm.Model() as fullmodel_null:
-                # fixed effects: 3 cell means 
-                # order: [Yq, Y0, Y6]
-                beta = pm.Normal('beta', 0, 5, shape=(n_conditions - 1)) # intercept is fixed
+#         with fullmodel_true:
+#             tracefulltrue = pm.sample(4000, 
+#                                 chains=4, 
+#                                 return_inferencedata=True, 
+#                                 target_accept=0.97, 
+#                                 cores=1, 
+#                                 idata_kwargs={"log_likelihood": True}, 
+#                                 progressbar=False)
 
-                # linear predictor
-                eta_fixed = (cvn[:, 1:] @ beta)                  # pick the appropriate cell mean
-                eta = fixed_intercept + eta_fixed + pm.math.sum(offset_vals * design, axis=1)
+#         # posterior means for all model variables
+#         posterior = tracefulltrue.posterior
+#         nuts_means = {
+#             var: posterior[var].mean(dim=("chain", "draw")).values
+#             for var in posterior.data_vars
+#         }
+#         nuts_stds = {
+#             var: posterior[var].std(dim=("chain", "draw")).values
+#             for var in posterior.data_vars
+#         }
+        
+#         rhat = az.rhat(tracefulltrue)
+        
+#         # we probably want to pass through the original data
+#         # conditional on the intervention
+#         trueresults.append([i, j, 0, rhat, nuts_means, nuts_stds, [statvals(data_full, interventions)]])
 
-                mu = pm.Deterministic('mu', pm.math.exp(eta))
+#         modelshape = list([f"{i}: {nuts_means[i].shape}" for i in nuts_means.keys()])
+#         for iv in interventions:
+#             assert iv in nuts_means, f"intervention must be on one of the model variables: {modelshape}"
+#             assert np.array(interventions[iv]).shape == nuts_means[iv].shape, f"intervention '{iv}' of shape {np.array(interventions[iv]).shape} must match model internals {modelshape}"
 
-                # likelihood zip
-                y_obs = pm.ZeroInflatedPoisson("y_obs", mu=mu, psi=fixed_psi, observed=obs)
+#         # counterfactual model with intervention vars clamped to 0 
+#         # but all other params as in full model
+#         with pm.do(fullmodel_true, interventions) as m_do:
+#             postpred_do = pm.sample_posterior_predictive(tracefulltrue, 
+#                                                         random_seed=0)
+            
+#         artificial_data = postpred_do.posterior_predictive['connectivity']\
+#                 .values.reshape(4 * 4000, -1) # (n_chain x n_samples, ...)
+        
+#         # sometimes posterior sampling creates spuriously-large values, which
+#         # can throw off posterior model fits and particularly posterior means
+#         # just clip these with a generous margin
+#         ad_max = data.connectivity.max() * 2
+#         artificial_data = np.clip(artificial_data, None, ad_max)
 
-                # see if sampler converges with obtaining invalid values
-                with warnings.catch_warnings():
-                    warnings.simplefilter("error", RuntimeWarning)
+#         # need to make sure we don't (likely) fit one model per chain within each sample
+#         # which would happen if we didn't shuffle the data (very unlikely now)
+#         np.random.seed(0)
+#         np.random.shuffle(artificial_data) # (n_chain x 4000, n_obs)        
 
-                    try:
-                        tracefullnull = pm.sample(4000, chains=4, return_inferencedata=True, 
-                                target_accept=0.95, cores=1, idata_kwargs={"log_likelihood": True}, 
-                                progressbar=False)
-                        badconvflag = False
+#         initialization_means = copy.deepcopy(nuts_means)
+#         # advi warm start initialization
+#         for var in initialization_means:
+#             if var in interventions:
+#                 initialization_means[var] = interventions[var]
 
-                    except RuntimeWarning as e:
-                        print(f"true model {i}->{j} caught a RuntimeWarning exception:", e)
-                        badconvflag = True
+#         # second stage: fit null models to artificial data
+#         for nmi in range(nullstartidx, nullstartidx+nullblocksize):
+#             data_null = data.copy()
+#             print(f"link {j}->{i} running artificial data null model {nmi}")
+#             nullobs = artificial_data[nmi]
+#             data_null['connectivity'] = nullobs
+            
+#             if nullmethod == 'posteriormeans':
+#                 # since zeros aren't estimated by hurdle_lognormal (see pymc docs)
+#                 # we manually re-add the zeros after sampling
+#                 data_null = pd.concat([data_null, data_zeros], axis=0)
+                
+#                 nullresults.append([i, j, nmi, None, statvals(data_null, interventions)])         
+#                 continue
 
-                # here the sampler will raise a runtime warning but will still proceed with sampling
-                # this way we will still obtain estimates, just with the knowledge that something
-                # didn't go right
-                if badconvflag:
-                    tracefullnull = pm.sample(4000, chains=4, return_inferencedata=True, 
-                                target_accept=0.95, cores=1, idata_kwargs={"log_likelihood": True}, 
-                                progressbar=False)
+#             nullmodel = bmb.Model(formula, data_null, priors=priors, family='hurdle_lognormal')
+#             nullmodel.build()
+#             nullmodel = nullmodel.backend.model
 
-                post = tracefullnull.posterior
-                if nullppc:
-                    postpred = pm.sample_posterior_predictive(tracefullnull, random_seed=0)
-                else:
-                    postpred = None
-                _mu = post['mu'].mean(dim=('chain', 'draw')).values
-                posterior_subsamples = {
-                    "beta": post['beta'].mean(dim=('chain', 'draw')).values,
-                    "mu": _mu,
-                    "psi": fixed_psi,
-                    "intercept": fixed_intercept,
-                    "predicted_samples": postpred,
-                    "badconv": badconvflag,
-                }
+#             rhat = None # rhat not meaningful for advi
+#             with nullmodel:
+#                 if nullmethod == 'advi':
+#                     approx = pm.fit(method='advi', progressbar=False, start=initialization_means, callbacks=[])
+#                     tracefullnull = approx.sample(4000)
+#                 elif nullmethod == 'nuts':
+#                     tracefullnull = pm.sample(4000, 
+#                                 chains=4, 
+#                                 return_inferencedata=True, 
+#                                 target_accept=0.97, 
+#                                 cores=1, 
+#                                 idata_kwargs={"log_likelihood": True}, 
+#                                 progressbar=False)
+                    
+#                     rhat = az.rhat(tracefulltrue)
+                    
+#                 else:
+#                     raise Exception(f"null model fit method {nullmethod} not supported")
 
-                rhat = None # az.rhat(tracefullnull)
-                nullresults.append([i, j, nmi, rhat, posterior_subsamples])
+#             posterior = tracefullnull.posterior
+#             advi_means = {
+#                 var: posterior[var].mean(dim=("chain", "draw")).values
+#                 for var in posterior.data_vars
+#             }
+#             advi_stds = {
+#                 var: posterior[var].std(dim=("chain", "draw")).values
+#                 for var in posterior.data_vars
+#             }
+            
+#             nullresults.append([i, j, nmi, rhat, advi_means, advi_stds])     
 
-    return trueresults, nullresults
+#     return trueresults, nullresults
 
+# +
+# def statvals(dfinput, interventions):
+#     dfinput = dfinput.copy()
+#     dfi_nonzero = dfinput[dfinput.connectivity > 0]
 
+#     inputsizes = {var:None for var in interventions}
+#     for var in interventions:
+#         inputsizes[var] = dfinput.groupby(var, observed=True).apply(lambda x: len(x), include_groups=False)
+        
+#     nzinputmeans = {var:None for var in interventions}
+#     for var in interventions:
+#         nzinputmeans[var] = dfi_nonzero.groupby(var, observed=True).apply(lambda x: np.log(x['connectivity']).mean(), 
+#                                                                           include_groups=False)
+
+#     nzinputstds = {var:None for var in interventions}
+#     for var in interventions:
+#         nzinputstds[var] = dfi_nonzero.groupby(var, observed=True).apply(lambda x: np.log(x['connectivity']).var(ddof=1), 
+#                                                                          include_groups=False)
+
+#     nzinputsizes = {var:None for var in interventions}
+#     for var in interventions:
+#         nzinputsizes[var] = dfi_nonzero.groupby(var, observed=True).apply(lambda x: len(x), include_groups=False)
+
+#     return nzinputmeans, nzinputstds, nzinputsizes, inputsizes 
+
+# def general_worker(chunk):
+#     print(f"running general model process {os.getpid()}")
+#     compiledir = f"/export/vrishab/compile/{os.getpid()}"
+#     pathlib.Path(compiledir).mkdir(parents=True, exist_ok=True)
+
+#     os.environ["PYTENSOR_FLAGS"] = f"compiledir={compiledir}"
+    
+#     trueresults = []
+#     nullresults = []
+#     for i, j, data_full, formula, priors, interventions, nullstartidx, nullblocksize, nullmethod in chunk:
+#         assert isinstance(data_full, pd.DataFrame), "data object must be a pandas dataframe"
+#         assert "connectivity" in data_full.columns, "data must have connectivity as a column name"
+#         assert 'zero' in formula and 'nonzero' in formula, "zero and nonzero model formulas must be provided"
+#         assert 'zero' in priors and 'nonzero' in priors, "zero and nonzero model priors must be provided (can be None)"
+        
+#         data = data_full[data_full.connectivity > 0]
+#         data_binary = data_full.copy()
+#         data_binary['connectivity'] = data_binary.connectivity == 0
+        
+#          # fit nonzero terms; hurdle doesn't work in bambi
+#         fullmodel_true = bmb.Model(formula['nonzero'], data, priors=priors['nonzero'], family='hurdle_lognormal')
+#         fullmodel_true.build()
+#         fullmodel_true = fullmodel_true.backend.model
+        
+#         fullmodel_true_bool = bmb.Model(formula['zero'], data_binary, priors=priors['zero'], family='bernoulli')
+#         fullmodel_true_bool.build()
+#         fullmodel_true_bool = fullmodel_true_bool.backend.model
+        
+#         try:
+#             with fullmodel_true:
+#                 tracefulltrue = pm.sample(4000, 
+#                                     chains=4, 
+#                                     return_inferencedata=True, 
+#                                     target_accept=0.97, 
+#                                     cores=1, 
+#                                     idata_kwargs={"log_likelihood": True}, 
+#                                     progressbar=False)
+
+#             with fullmodel_true_bool:
+#                 tracefulltruebool = pm.sample(4000, 
+#                                     chains=4, 
+#                                     return_inferencedata=True, 
+#                                     target_accept=0.97, 
+#                                     cores=1, 
+#                                     idata_kwargs={"log_likelihood": True}, 
+#                                     progressbar=False)
+            
+#         except ValueError as ex:
+#             print(f"worker received valueerror for cell ({i}, {j}): '{ex}'")
+#             print("This is likely because one or more grouping variables have no data")
+#             continue
+            
+#         posterior = tracefulltrue.posterior
+#         posteriorbool = tracefulltruebool.posterior
+#         rhatnz = az.rhat(tracefulltrue)
+#         rhatbool = az.rhat(tracefulltruebool)
+        
+#         # pass through the original data conditional on the intervention
+#         nzinputmeans, nzinputstds, nzinputsizes, inputsizes = statvals(data_full, interventions)
+#         trueresults.append([i, j, 0, [rhatnz, rhatbool], nzinputmeans, nzinputstds, nzinputsizes, inputsizes])
+
+#         # counterfactual model with intervention vars clamped to 0 
+#         # but all other params as in full model
+#         with pm.do(fullmodel_true, interventions) as m_do:
+#             postpred_do = pm.sample_posterior_predictive(tracefulltrue, 
+#                                                         random_seed=0)
+        
+#         # counterfactual for bool model
+#         with pm.do(fullmodel_true_bool, interventions) as m_do:
+#             postpred_bool_do = pm.sample_posterior_predictive(tracefulltruebool, 
+#                                                         random_seed=0)
+            
+#         artificial_data = postpred_do.posterior_predictive['connectivity']\
+#                 .values.reshape(4 * 4000, -1) # (n_chain x n_samples, ...)
+            
+#         artificial_data_bool = postpred_bool_do.posterior_predictive['connectivity']\
+#                 .values.reshape(4 * 4000, -1) # (n_chain x n_samples, ...)
+        
+#         # sometimes posterior sampling creates spuriously-large values, which
+#         # can throw off posterior model fits and particularly posterior means
+#         # just clip these with a generous margin
+#         ad_max = data.connectivity.max() * 2
+#         artificial_data = np.clip(artificial_data, None, ad_max)
+
+#         # need to make sure we don't (likely) fit one model per chain within each sample
+#         # which would happen if we didn't shuffle the data (very unlikely now)
+#         np.random.seed(0)
+#         np.random.shuffle(artificial_data) # (n_chain x 4000, n_obs)        
+        
+#         np.random.seed(0)
+#         np.random.shuffle(artificial_data_bool) # (n_chain x 4000, n_obs)        
+
+#         # second stage: null models from artificial data
+#         for nmi in range(nullstartidx, nullstartidx+nullblocksize):
+#             print(f"link {j}->{i} running artificial data null model {nmi}")
+                
+#             data_null = data.copy()
+#             data_null_bool = data_binary.copy()
+            
+#             nullobs = artificial_data[nmi]
+#             nullboolobs = artificial_data_bool[nmi]
+            
+#             data_null['connectivity'] = nullobs
+#             data_null_bool['connectivity'] = nullboolobs
+            
+#             if nullmethod == 'posteriormeans':
+#                 # estimate null model nonzero means and stds from nonzero data
+#                 nzinputmeans, nzinputstds, _, _ = statvals(data_null, interventions)
+#                 # estimate nonzero and zero null values from bernoulli model
+#                 _, _, nzinputsizes, inputsizes = statvals(data_null_bool, interventions)
+                
+#                 nullresults.append([i, j, nmi, None, nzinputmeans, nzinputstds, nzinputsizes, inputsizes])         
+#                 continue
+   
+
+#     return trueresults, nullresults
 # -
-def simple_worker_zip_conditiononly_norandslopes(chunk):
-    import pymc_extras as pmx    
+def statvals(dfinput, interventions, posteriordata):        
+    groups = dfinput[list(interventions.keys())[0]].unique()
+    
+    diff_means = {k:None for k in groups}
+    for group in groups:
+        idxs = (dfinput[list(interventions.keys())[0]] == group).values
+        diff_means[group] = posteriordata[:, idxs].mean()
+        
+    diff_vars = {k:None for k in groups}
+    for group in groups:
+        idxs = (dfinput[list(interventions.keys())[0]] == group).values
+        diff_vars[group] = posteriordata[:, idxs].var(ddof=1)
 
-    print(f"running integrated zip models process {os.getpid()}")
-    if len(chunk) == 0:
-        return None
     
-    S = chunk[0][-3]
-    usemask = chunk[0][-2]
-    mode = chunk[0][-1]
+    return diff_means, diff_vars
+
+
+def general_worker(chunk):
+    print(f"running general model process {os.getpid()}")
+    compiledir = f"/export/vrishab/compile/{os.getpid()}"
+    pathlib.Path(compiledir).mkdir(parents=True, exist_ok=True)
+
+    os.environ["PYTENSOR_FLAGS"] = f"compiledir={compiledir}"
     
-    n_subs = len(np.unique(S))
     trueresults = []
     nullresults = []
-    for i, j, data, X, Z, nullstartidx, nullblocksize, S, usemask, mode in chunk:
-        nullmode = mode["nullmode"]
-        reducedmode = mode["reducedmode"]
-        nullppc = mode["nullppc"]
-
-        obs = data[usemask]
-        cv = X[usemask]
-        subs = S[usemask]
-        design = Z[usemask]
-        n_conditions = cv.shape[1]
-
-        # first stage: fit true model
-        with pm.Model() as fullmodel_true:
-            # fixed effects parameters
-            intercept = pm.Normal("intercept", mu=0, sigma=10)                 # population baseline log-mean
-            beta = pm.Normal('beta', 0, 5, shape=(n_conditions-1))
-
-            # random effects (1 + condition | subject) 
-#             sd = pm.HalfNormal.dist(1.0, shape=n_conditions)
-#             chol, _, _ = pm.LKJCholeskyCov('chol', n=n_conditions, eta=2.0, sd_dist=sd)
-#             re_raw = pm.Normal('re_raw', 0, 1, shape=(n_subs, n_conditions))
-#             RE = pm.Deterministic('RE', re_raw @ chol.T)
-#             bRE  = RE[subs, :]        # random effects (n_obs, n_conditions)
-            
-            # random effects (1|subject)
-            sigma_sub = pm.HalfNormal("subject_re_sigma", sigma=10)
-            subject_offset = pm.Normal("subject_offset", mu=0, sigma=1, shape=n_subs)
-            subject_effects = pm.Deterministic("RE", subject_offset * sigma_sub)
-
-            # linear predictor
-            # beta_intercept + ind(beta_0dB) + ind(beta_-6dB) + re_intercept + ind(re_0dB) + ind(re_-6dB)
-            eta_fixed = (cv[:, 1:] @ beta)   # fixed effects
-            eta = intercept + eta_fixed + subject_effects[subs] #+ pm.math.sum(bRE * design, axis=1)
-#             eta = intercept + eta_fixed + pm.math.sum(bRE * design, axis=1)
-
-            mu  = pm.Deterministic('mu', pm.math.exp(eta))
-
-            # likelihood zip
-            conditions = cv
-            conditions[:, 0] = (conditions[:, 1:].sum(axis=1) == 0).astype(int)
-            
-            # pooled per condition psis
-#             alpha_psi_mu = pm.Normal('alpha_psi_mu', 0., 1.)
-#             alpha_psi_sd = pm.HalfNormal('alpha_psi_sd', 1.)
-#             alpha_psi_offset = pm.Normal('alpha_psi_offset', 0., 1., shape=n_conditions)
-#             alpha_psi = pm.Deterministic('psi_latent', alpha_psi_mu + alpha_psi_offset * alpha_psi_sd)    # (n_conditions,)
-#             psi_cond = pm.Deterministic('psi', pm.math.sigmoid(conditions @ alpha_psi))
-            psi = pm.Beta("psi", 1, 1)
-            
-            y_obs = pm.ZeroInflatedPoisson("y_obs", mu=mu, psi=psi, observed=obs)
-
-            # see if sampler converges with obtaining invalid values
-            with warnings.catch_warnings():
-                warnings.simplefilter("error", RuntimeWarning)
-                
-                try:
-                    tracefulltrue = pm.sample(4000, chains=4, return_inferencedata=True, 
-                            target_accept=0.95, cores=1, idata_kwargs={"log_likelihood": True}, 
-                            progressbar=False)
-                    badconvflag = False
-            
-                except RuntimeWarning as e:
-                    print(f"true model {i}->{j} caught a RuntimeWarning exception:", e)
-                    badconvflag = True
-                
-            # here the sampler will raise a runtime warning but will still proceed with sampling
-            # this way we will still obtain estimates, just with the knowledge that something
-            # didn't go right
-            if badconvflag:
-                tracefulltrue = pm.sample(4000, chains=4, return_inferencedata=True, 
-                            target_accept=0.95, cores=1, idata_kwargs={"log_likelihood": True}, 
-                            progressbar=False)
-            
-            post = tracefulltrue.posterior
-            postpred = pm.sample_posterior_predictive(tracefulltrue, random_seed=0)
-            _intercept = post['intercept'].mean(dim=('chain', 'draw')).values
-            _mu = post['mu'].mean(dim=('chain', 'draw')).values
-            _psi = post['psi'].mean().item()
-            posterior_subsamples = {
-                "intercept": _intercept, 
-                "beta": post['beta'].mean(dim=('chain', 'draw')).values,
-                "RE": post["RE"].mean(dim=("chain", "draw")).values,
-                "mu": _mu,
-                "psi": _psi,
-                "obs": obs,
-                "predicted_samples": postpred,
-                "badconv": badconvflag,
-            }
-            rhat = None # az.rhat(tracefulltrue)
-            trueresults.append([i, j, 0, rhat, posterior_subsamples])
+    for i, j, data_full, formula, priors, interventions, nullstartidx, nullblocksize, nullmethod in chunk:
+        assert nullblocksize < 4*4000, "null blocksize must be less than chains (4) * draws (4000)"
+        assert (4*4000)//nullblocksize == (4*4000)/nullblocksize, "null blocksize must evenly divide chains (4) * draws (4000)"
+        assert isinstance(data_full, pd.DataFrame), "data object must be a pandas dataframe"
+        assert "connectivity" in data_full.columns, "data must have connectivity as a column name"
+        assert 'zero' in formula and 'nonzero' in formula, "zero and nonzero model formulas must be provided"
+        assert 'zero' in priors and 'nonzero' in priors, "zero and nonzero model priors must be provided (can be None)"
+        assert len(interventions) == 1, 'only single variable (length 1) interventions are supported'
         
-        subject_effects_mean = post["RE"].mean(dim=('chain', 'draw')).values
-        offset_vals = subject_effects_mean[subs]
-        fixed_psi = _psi
-        fixed_intercept = post['intercept'].mean().item()
+        data = data_full[data_full.connectivity > 0]
+        data_binary = data_full.copy()
+        data_binary['connectivity'] = data_binary.connectivity == 0
+        
+         # fit nonzero terms; hurdle doesn't work in bambi
+        fullmodel_true = bmb.Model(formula['nonzero'], data, priors=priors['nonzero'], family='hurdle_lognormal')
+        fullmodel_true.build()
+        fullmodel_true = fullmodel_true.backend.model
+        
+        fullmodel_true_bool = bmb.Model(formula['zero'], data_binary, priors=priors['zero'], family='bernoulli')
+        fullmodel_true_bool.build()
+        fullmodel_true_bool = fullmodel_true_bool.backend.model
+        
+        try:
+            with fullmodel_true:
+                tracefulltrue = pm.sample(4000, 
+                                    chains=4, 
+                                    return_inferencedata=True, 
+                                    target_accept=0.97, 
+                                    cores=1, 
+                                    idata_kwargs={"log_likelihood": True}, 
+                                    progressbar=False)
 
-        # second stage: fit null models using random effects posterior means
-        for nmi in range(nullstartidx, nullstartidx+nullblocksize):
-            print(f"link {j}->{i} running permuted null model {nmi}")
-            cvshape = X.shape
-            usemaskshape = usemask.shape
+            with fullmodel_true_bool:
+                tracefulltruebool = pm.sample(4000, 
+                                    chains=4, 
+                                    return_inferencedata=True, 
+                                    target_accept=0.97, 
+                                    cores=1, 
+                                    idata_kwargs={"log_likelihood": True}, 
+                                    progressbar=False)
+            
+        except ValueError as ex:
+            print(f"worker received valueerror for cell ({i}, {j}): '{ex}'")
+            print("This is likely because one or more grouping variables have no data")
+            continue
+            
+        posterior = tracefulltrue.posterior
+        posteriorbool = tracefulltruebool.posterior
+        post_mu = posterior.mu
+        post_p = posterior.p
+        if nullmethod == 'onlymu':
+            post_p = None
+        
+        rhatnz = az.rhat(tracefulltrue)
+        rhatbool = az.rhat(tracefulltruebool)
+        
+        trueresults.append([i, j, 0, [rhatnz, rhatbool], post_mu, post_p, data, data_binary])
 
-            covar_null = X.copy().reshape(n_subs, -1)
-#             usemask_null = usemask.copy().reshape(n_subs, -1)
+        # counterfactual for nonzero model
+        with pm.do(fullmodel_true, interventions) as m_do:
+            postpred_do = mu_cf = pm.sample_posterior_predictive(
+                tracefulltrue,
+                var_names=["mu"],  
+                random_seed=0
+            )
 
-            np.random.seed(nmi)
-            idxs = list(range(n_subs))
-            np.random.shuffle(idxs)
+        # counterfactual for bool model
+        with pm.do(fullmodel_true_bool, interventions) as m_do:
+            postpred_bool_do = pm.sample_posterior_predictive(
+                tracefulltrue,
+                var_names=["p"],  
+                random_seed=0
+            )
+            
+        post_cf_mu = postpred_do.posterior_predictive.mu
+        post_cf_p = postpred_bool_do.posterior_predictive.p
+        
+        if nullmethod == 'onlymu':
+            post_cf_p = None
+            
+        nullresults.append([i, j, None, None, post_cf_mu, post_cf_p, None, None]) 
 
-            covar_null = covar_null[idxs]
-            covar_null = covar_null.reshape(*cvshape)
-#             usemask_null = usemask_null[idxs]
-#             usemask_null = usemask_null.reshape(*usemaskshape)
-
-            cvn = covar_null[usemask]
-
-            with pm.Model() as fullmodel_null:
-                # fixed effects: 3 cell means 
-                # order: [Yq, Y0, Y6]
-                beta = pm.Normal('beta', 0, 5, shape=(n_conditions - 1)) # intercept is fixed
-
-                # linear predictor
-                eta_fixed = (cvn[:, 1:] @ beta)                  # pick the appropriate cell mean
-                eta = fixed_intercept + eta_fixed + offset_vals
-
-                mu = pm.Deterministic('mu', pm.math.exp(eta))
-
-                # likelihood zip
-                y_obs = pm.ZeroInflatedPoisson("y_obs", mu=mu, psi=fixed_psi, observed=obs)
-
-                # see if sampler converges with obtaining invalid values
-                with warnings.catch_warnings():
-                    warnings.simplefilter("error", RuntimeWarning)
-
-                    try:
-                        tracefullnull = pm.sample(4000, chains=4, return_inferencedata=True, 
-                                target_accept=0.95, cores=1, idata_kwargs={"log_likelihood": True}, 
-                                progressbar=False)
-                        badconvflag = False
-
-                    except RuntimeWarning as e:
-                        print(f"true model {i}->{j} caught a RuntimeWarning exception:", e)
-                        badconvflag = True
-
-                # here the sampler will raise a runtime warning but will still proceed with sampling
-                # this way we will still obtain estimates, just with the knowledge that something
-                # didn't go right
-                if badconvflag:
-                    tracefullnull = pm.sample(4000, chains=4, return_inferencedata=True, 
-                                target_accept=0.95, cores=1, idata_kwargs={"log_likelihood": True}, 
-                                progressbar=False)
-
-                post = tracefullnull.posterior
-                if nullppc:
-                    postpred = pm.sample_posterior_predictive(tracefullnull, random_seed=0)
-                else:
-                    postpred = None
-                _mu = post['mu'].mean(dim=('chain', 'draw')).values
-                posterior_subsamples = {
-                    "beta": post['beta'].mean(dim=('chain', 'draw')).values,
-                    "mu": _mu,
-                    "psi": fixed_psi,
-                    "intercept": fixed_intercept,
-                    "predicted_samples": postpred,
-                    "badconv": badconvflag,
-                }
-
-                rhat = None # az.rhat(tracefullnull)
-                nullresults.append([i, j, nmi, rhat, posterior_subsamples])
-
+   
     return trueresults, nullresults
 
 
-def simple_worker_conditiononly_norandslopes(chunk):
-    import pymc_extras as pmx    
 
-    print(f"running integrated zip models process {os.getpid()}")
+
+
+
+def simple_worker_randint(chunk):   
+    print(f"running integrated, random intercept ztp models process {os.getpid()}")
     if len(chunk) == 0:
         return None
     
@@ -1310,60 +686,53 @@ def simple_worker_conditiononly_norandslopes(chunk):
     nullresults = []
     for i, j, data, X, Z, nullstartidx, nullblocksize, S, usemask, mode in chunk:
         nullmode = mode["nullmode"]
-        reducedmode = mode["reducedmode"]
         nullppc = mode["nullppc"]
         exposure = mode["exposure"]
         modeltype = mode["modeltype"]
+        clamp_idx = mode["clamp_indices"]
 
         obs = data[usemask]
         cv = X[usemask]
         subs = S[usemask]
         design = Z[usemask]
-        n_conditions = cv.shape[1]
-        
-        # hurdle models nonzero distinctly
-        cv = cv[obs > 0]
-        subs = subs[obs > 0]
-        design = design[obs > 0]
+        exposure = exposure[usemask]
 
-        # first stage: fit true model
         with pm.Model() as fullmodel_true:
             # fixed effects parameters
-            intercept = pm.Normal("intercept", mu=0, sigma=10)                 # population baseline log-mean
-            beta = pm.Normal('beta', 0, 5, shape=(n_conditions-1))
+            if modeltype != 'lognormal': # different parameterization
+                intercept = pm.Normal("intercept", mu=0, sigma=10)                 # population baseline log-mean
+                beta = pm.Normal('beta', 0, 5, shape=(cv.shape[1] - 1))
 
-            # random effects (1 + condition | subject) 
-#             sd = pm.HalfNormal.dist(1.0, shape=n_conditions)
-#             chol, _, _ = pm.LKJCholeskyCov('chol', n=n_conditions, eta=2.0, sd_dist=sd)
-#             re_raw = pm.Normal('re_raw', 0, 1, shape=(n_subs, n_conditions))
-#             RE = pm.Deterministic('RE', re_raw @ chol.T)
-#             bRE  = RE[subs, :]        # random effects (n_obs, n_conditions)
-            
-            # random effects (1|subject)
-            sigma_sub = pm.HalfNormal("subject_re_sigma", sigma=10)
-            subject_offset = pm.Normal("subject_offset", mu=0, sigma=1, shape=n_subs)
-            subject_effects = pm.Deterministic("RE", subject_offset * sigma_sub)
+                # random effects (1|subject)
+                sigma_sub = pm.HalfNormal("subject_re_sigma", sigma=10)
+                subject_offset = pm.Normal("subject_offset", mu=0, sigma=1, shape=n_subs)
+                subject_effects = pm.Deterministic("RE", subject_offset * sigma_sub)
 
-            # linear predictor
-            # beta_intercept + ind(beta_0dB) + ind(beta_-6dB) + re_intercept + ind(re_0dB) + ind(re_-6dB)
-            eta_fixed = (cv[:, 1:] @ beta)   # fixed effects
-            eta = intercept + eta_fixed + exposure + subject_effects[subs] #+ pm.math.sum(bRE * design, axis=1)
-#             eta = intercept + eta_fixed + pm.math.sum(bRE * design, axis=1)
+                # linear predictor
+                # beta_intercept + ind(beta_0dB) + ind(beta_-6dB) + re_intercept + ind(re_0dB) + ind(re_-6dB)
+                eta_fixed = (cv[obs > 0, 1:] @ beta)   # fixed effects
+                eta = intercept + eta_fixed + exposure[obs > 0] + subject_effects[subs[obs > 0]]
 
-            mu  = pm.Deterministic('mu', pm.math.exp(eta))
+                mu  = pm.Deterministic('mu', pm.math.exp(eta))
+                psi = pm.Beta("psi", 1, 1)
+            else:
+                intercept = pm.Normal("intercept", mu=0, sigma=5)                 # population baseline log-mean
+                beta = pm.Normal('beta', 0, 2, shape=(cv.shape[1] - 1))
+                sigma = pm.Exponential("sigma", 1)
 
-            # likelihood zip
-#             conditions = cv
-#             conditions[:, 0] = (conditions[:, 1:].sum(axis=1) == 0).astype(int)
-            
-            # pooled per condition psis
-#             alpha_psi_mu = pm.Normal('alpha_psi_mu', 0., 1.)
-#             alpha_psi_sd = pm.HalfNormal('alpha_psi_sd', 1.)
-#             alpha_psi_offset = pm.Normal('alpha_psi_offset', 0., 1., shape=n_conditions)
-#             alpha_psi = pm.Deterministic('psi_latent', alpha_psi_mu + alpha_psi_offset * alpha_psi_sd)    # (n_conditions,)
-#             psi_cond = pm.Deterministic('psi', pm.math.sigmoid(conditions @ alpha_psi))
-            psi = pm.Beta("psi", 1, 1)
-    
+                # random effects (1|subject)
+                sigma_sub = pm.Exponential("subject_re_sigma", 1)
+                subject_offset = pm.Normal("subject_offset", mu=0, sigma=1, shape=n_subs)
+                subject_effects = pm.Deterministic("RE", subject_offset * sigma_sub)
+
+                # linear predictor
+                # beta_intercept + ind(beta_0dB) + ind(beta_-6dB) + re_intercept + ind(re_0dB) + ind(re_-6dB)
+                eta_fixed = (cv[obs > 0, 1:] @ beta)   # fixed effects
+                eta = intercept + eta_fixed + exposure[obs > 0] + subject_effects[subs[obs > 0]]
+
+                mu  = pm.Deterministic('mu', eta)
+                psi = pm.Beta("psi", 1, 1)
+
             if modeltype == 'gamma':
                 sigma = pm.HalfNormal("sigma", sigma=1)
                 y_obs = pm.Gamma("y_obs", mu=mu, sigma=sigma, observed=obs[obs > 0])
@@ -1375,23 +744,25 @@ def simple_worker_conditiononly_norandslopes(chunk):
                 lam_rel = pm.Beta("lam_rel", 2, 2)
                 lam = pm.Deterministic("lam", lower + lam_rel * (1.0 - lower))
                 y_obs = pmx.distributions.GeneralizedPoisson(mu=mu, lam=lam, observed=obs[obs>0])
-            
+            elif modeltype == 'lognormal':
+                y_obs = pm.LogNormal("y_obs", mu=mu, sigma=sigma, observed=obs[obs>0])
+
             pm.Bernoulli("y_bernoulli", p=1 - psi, observed=(obs == 0) * 1.0)
 
             # see if sampler converges with obtaining invalid values
             with warnings.catch_warnings():
                 warnings.simplefilter("error", RuntimeWarning)
-                
+
                 try:
                     tracefulltrue = pm.sample(4000, chains=4, return_inferencedata=True, 
                             target_accept=0.95, cores=1, idata_kwargs={"log_likelihood": True}, 
                             progressbar=False)
                     badconvflag = False
-            
+
                 except RuntimeWarning as e:
                     print(f"true model {i}->{j} caught a RuntimeWarning exception:", e)
                     badconvflag = True
-                
+
             # here the sampler will raise a runtime warning but will still proceed with sampling
             # this way we will still obtain estimates, just with the knowledge that something
             # didn't go right
@@ -1399,9 +770,13 @@ def simple_worker_conditiononly_norandslopes(chunk):
                 tracefulltrue = pm.sample(4000, chains=4, return_inferencedata=True, 
                             target_accept=0.95, cores=1, idata_kwargs={"log_likelihood": True}, 
                             progressbar=False)
-            
+
             post = tracefulltrue.posterior
-            postpred = pm.sample_posterior_predictive(tracefulltrue, random_seed=0)
+            if nullstartidx == 0: # only do the first one to save mem
+                postpred = pm.sample_posterior_predictive(tracefulltrue, random_seed=0)
+            else:
+                postpred = None
+                
             _intercept = post['intercept'].mean(dim=('chain', 'draw')).values
             _mu = post['mu'].mean(dim=('chain', 'draw')).values
             _psi = post['psi'].mean().item()
@@ -1411,258 +786,83 @@ def simple_worker_conditiononly_norandslopes(chunk):
                 "RE": post["RE"].mean(dim=("chain", "draw")).values,
                 "mu": _mu,
                 "psi": _psi,
-                "exposure": exposure,
+                "exposure": exposure[obs > 0],
                 "obs": obs,
                 "predicted_samples": postpred,
                 "badconv": badconvflag,
+                "clamp": clamp_idx,
             }
             rhat = None # az.rhat(tracefulltrue)
             trueresults.append([i, j, 0, rhat, posterior_subsamples])
         
-        subject_effects_mean = post["RE"].mean(dim=('chain', 'draw')).values
-        offset_vals = subject_effects_mean[subs]
-        fixed_psi = _psi
-        if modeltype == 'gamma':
-            fixed_sigma = post['sigma'].mean().item()
-        elif modeltype == 'genpois':
-            fixed_lam_rel = post['lam_rel'].mean().item()
-        fixed_intercept = post['intercept'].mean().item()
+        # clamp relevant indices of symbolic beta vector to 0
+        beta = fullmodel_true["beta"]
+        mask_t = pt.constant(clamp_idx)
+        beta_do = beta * mask_t
 
-        # second stage: fit null models using random effects posterior means
-        for nmi in range(nullstartidx, nullstartidx+nullblocksize):
-            print(f"link {j}->{i} running permuted null model {nmi}")
-            cvshape = X.shape
-            usemaskshape = usemask.shape
-
-            covar_null = X.copy().reshape(n_subs, -1)
-#             usemask_null = usemask.copy().reshape(n_subs, -1)
-
-            np.random.seed(nmi)
-            idxs = list(range(n_subs))
-            np.random.shuffle(idxs)
-
-            covar_null = covar_null[idxs]
-            covar_null = covar_null.reshape(*cvshape)
-#             usemask_null = usemask_null[idxs]
-#             usemask_null = usemask_null.reshape(*usemaskshape)
+        # counterfactual model with beta forced to 0 but all other params as in full model
+        with pm.do(fullmodel_true, {beta: beta_do}) as m_do:
+            postpred_do = pm.sample_posterior_predictive(tracefulltrue, random_seed=0)
             
-            
-
-            cvn = covar_null[usemask] # usemask tells which obs not to use so should be unpermuted
-            cvn = cvn[obs > 0]        
-
-            with pm.Model() as fullmodel_null:
-                # fixed effects: 3 cell means 
-                # order: [Yq, Y0, Y6]
-                beta = pm.Normal('beta', 0, 5, shape=(n_conditions - 1)) # intercept is fixed
-
-                # linear predictor
-                eta_fixed = (cvn[:, 1:] @ beta)                  # pick the appropriate cell mean
-                eta = fixed_intercept + eta_fixed + exposure + offset_vals
-
-                mu = pm.Deterministic('mu', pm.math.exp(eta))
-
-                # likelihood zip
-                if modeltype == 'gamma':
-                    y_obs = pm.Gamma("y_obs", mu=mu, sigma=fixed_sigma, observed=obs[obs > 0])
-                elif modeltype == 'poisson':
-                    y_obs = pm.Poisson("y_obs", mu=mu, observed=obs[obs > 0])
-                elif modeltype == 'genpois':
-                    lower = pm.math.maximum(-1.0, -mu / 4.0)
-                    # fraction between lower and 1
-                    lam = pm.Deterministic("lam", lower + fixed_lam_rel * (1.0 - lower))
-                    y_obs = pmx.distributions.GeneralizedPoisson(mu=mu, lam=lam, observed=obs[obs>0])
-                
-                pm.Bernoulli("y_bernoulli", p=1 - fixed_psi, observed=(obs == 0) * 1.0)
-
-                # see if sampler converges with obtaining invalid values
-                with warnings.catch_warnings():
-                    warnings.simplefilter("error", RuntimeWarning)
-
-                    try:
-                        tracefullnull = pm.sample(4000, chains=4, return_inferencedata=True, 
-                                target_accept=0.95, cores=1, idata_kwargs={"log_likelihood": True}, 
-                                progressbar=False)
-                        badconvflag = False
-
-                    except RuntimeWarning as e:
-                        print(f"true model {i}->{j} caught a RuntimeWarning exception:", e)
-                        badconvflag = True
-
-                # here the sampler will raise a runtime warning but will still proceed with sampling
-                # this way we will still obtain estimates, just with the knowledge that something
-                # didn't go right
-                if badconvflag:
-                    tracefullnull = pm.sample(4000, chains=4, return_inferencedata=True, 
-                                target_accept=0.95, cores=1, idata_kwargs={"log_likelihood": True}, 
-                                progressbar=False)
-
-                post = tracefullnull.posterior
-                if nullppc:
-                    postpred = pm.sample_posterior_predictive(tracefullnull, random_seed=0)
-                else:
-                    postpred = None
-                _mu = post['mu'].mean(dim=('chain', 'draw')).values
-                posterior_subsamples = {
-                    "beta": post['beta'].mean(dim=('chain', 'draw')).values,
-                    "mu": _mu,
-                    "psi": fixed_psi,
-                    "intercept": fixed_intercept,
-                    "predicted_samples": postpred,
-                    "badconv": badconvflag,
-                }
-
-                rhat = None # az.rhat(tracefullnull)
-                nullresults.append([i, j, nmi, rhat, posterior_subsamples])
-
-    return trueresults, nullresults
-
-
-def simple_worker_conditiononly_norandslopes_reduced_full(chunk):
-    import pymc_extras as pmx    
-
-    print(f"running integrated zip models process {os.getpid()}")
-    if len(chunk) == 0:
-        return None
-    
-    S = chunk[0][-3]
-    usemask = chunk[0][-2]
-    mode = chunk[0][-1]
-    
-    n_subs = len(np.unique(S))
-    trueresults = []
-    nullresults = []
-    for i, j, data, X, Z, nullstartidx, nullblocksize, S, usemask, mode in chunk:
-        nullmode = mode["nullmode"]
-        reducedmode = mode["reducedmode"]
-        nullppc = mode["nullppc"]
-        exposure = np.log(mode["exposure"])
-        modeltype = mode["modeltype"]
-
-        obs = data[usemask]
-        cv = X[usemask]
-        subs = S[usemask]
-        design = Z[usemask]
-        n_conditions = cv.shape[1]
-        
-        # hurdle models nonzero distinctly
-        intercept_mask = [bool(np.all(i == [1, 0, 0])) for i in cv] # only quiet condition
-        intercept_subs = subs[(obs > 0) & (intercept_mask)]
-        intercept_cv = cv[(obs > 0) & (intercept_mask)]
-
-        # first stage: fit reduced model
-        with pm.Model() as reducedmodel:
-            # fixed effects parameters
-            intercept = pm.Normal("intercept", mu=0, sigma=10)                 # population baseline log-mean
-
-            # random effects (1|subject)
-            sigma_sub = pm.HalfNormal("subject_re_sigma", sigma=10)
-            subject_offset = pm.Normal("subject_offset", mu=0, sigma=1, shape=n_subs)
-            subject_effects = pm.Deterministic("RE", subject_offset * sigma_sub)
-
-            # linear predictor
-            eta = intercept + exposure + subject_effects[intercept_subs]
-
-            mu  = pm.Deterministic('mu', pm.math.exp(eta))
-            psi = pm.Beta("psi", 1, 1)
-
-            if modeltype == 'gamma':
-                sigma = pm.HalfNormal("sigma", sigma=1)
-                y_obs = pm.Gamma("y_obs", mu=mu, sigma=sigma, observed=obs[(obs > 0) & (intercept_mask)])
-            elif modeltype == 'poisson':
-                y_obs = pm.Poisson("y_obs", mu=mu, observed=obs[(obs > 0) & (intercept_mask)])
-            elif modeltype == 'genpois':
-                lower = pm.math.maximum(-1.0, -mu / 4.0)
-                # fraction between lower and 1
-                lam_rel = pm.Beta("lam_rel", 2, 2)
-                lam = pm.Deterministic("lam", lower + lam_rel * (1.0 - lower))
-                y_obs = pmx.distributions.GeneralizedPoisson(mu=mu, lam=lam, observed=obs[(obs > 0) & (intercept_mask)])
-
-            pm.Bernoulli("y_bernoulli", p=1 - psi, observed=(obs[intercept_mask] == 0) * 1.0)
-
-            # see if sampler converges with obtaining invalid values
-            with warnings.catch_warnings():
-                warnings.simplefilter("error", RuntimeWarning)
-
-                try:
-                    tracereduced = pm.sample(4000, chains=4, return_inferencedata=True, 
-                            target_accept=0.95, cores=1, idata_kwargs={"log_likelihood": True}, 
-                            progressbar=False)
-                    badconvflag = False
-
-                except RuntimeWarning as e:
-                    print(f"true model {i}->{j} caught a RuntimeWarning exception:", e)
-                    badconvflag = True
-
-            # here the sampler will raise a runtime warning but will still proceed with sampling
-            # this way we will still obtain estimates, just with the knowledge that something
-            # didn't go right
-            if badconvflag:
-                tracereduced = pm.sample(4000, chains=4, return_inferencedata=True, 
-                            target_accept=0.95, cores=1, idata_kwargs={"log_likelihood": True}, 
-                            progressbar=False)
-
-            expanded_idata = tracereduced.copy()
-            
-            # to fit the intercept we are only using quiet sessions (~1/3 of data)
-            # so multiply pp samples by 3 so we get 0dB and -6dB null sessions too. 
-            # this does not repeat the quiet pp, but instead draws two additional 
-            # samples from the same chains
-            expanded_idata.posterior = tracereduced.posterior.expand_dims(y_obs_newdim=3)
-            with reducedmodel:
-                pm.sample_posterior_predictive(
-                    expanded_idata,
-                    sample_dims=["chain", "draw", "y_obs_newdim"],
-                    extend_inferencedata=True,
-                )
-
-            postpred = expanded_idata.posterior_predictive
-        
-        
-        artificial_data = postpred.y_obs.values.reshape(4 * 4000, -1) # (n_chain x n_samples, n_obs * 3)
+        artificial_data = postpred_do.posterior_predictive['y_obs'].values.reshape(4 * 4000, -1) # (n_chain x n_samples, n_obs * 3)
         
         # need to make sure we don't (likely) fit one model per chain within each sample
         # which would happen if we didn't shuffle the data (very unlikely now)
         np.random.seed(0)
         np.random.shuffle(artificial_data) # (n_chain x 4000, n_obs)
+
+        mcmc_means = {var: tracefulltrue.posterior[var].mean(dim=("chain", "draw")).values 
+                    for var in tracefulltrue.posterior.data_vars}
+        mcmc_means['beta'] = mcmc_means['beta'] * mask_t # do operator set this to 0
         
         # second stage: fit null models to artificial data
         for nmi in range(nullstartidx, nullstartidx+nullblocksize):
             print(f"link {j}->{i} running artificial data null model {nmi}")
             
-            # make 0dB and -6dB indicators
-            cvzero = intercept_cv.copy()
-            cvsix = intercept_cv.copy()
-            cvzero[:, 1] = 1
-            cvsix[:, 2] = 1
-
-            cvnull = np.concatenate([intercept_cv, cvzero, cvsix], axis=0)
-            subsnull = np.concatenate([intercept_subs, intercept_subs, intercept_subs], axis=0)
-            
             nullobs = artificial_data[nmi]
-            cvnull = cvnull[nullobs > 0]
-            subsnull = subsnull[nullobs > 0]
+            cvnull = cv[obs > 0] # the artificial data are derived from only nonzero observations
+            subsnull = subs[obs > 0]
+            exposurenull = exposure[obs > 0]
 
             print(f"link {j}->{i} running null model {nmi}")
 
             # everything else exactly the same as true full model
             with pm.Model() as nullmodel:
                 # fixed effects parameters
-                intercept = pm.Normal("intercept", mu=0, sigma=10)                 # population baseline log-mean
-                beta = pm.Normal('beta', 0, 5, shape=(n_conditions-1))
+                if modeltype != 'lognormal':
+                    intercept = pm.Normal("intercept", mu=0, sigma=10)                 # population baseline log-mean
+                    beta = pm.Normal('beta', 0, 5, shape=(cvnull.shape[1]-1))
 
-                # random effects (1|subject)
-                sigma_sub = pm.HalfNormal("subject_re_sigma", sigma=10)
-                subject_offset = pm.Normal("subject_offset", mu=0, sigma=1, shape=n_subs)
-                subject_effects = pm.Deterministic("RE", subject_offset * sigma_sub)
+                    # random effects (1|subject)
+                    sigma_sub = pm.HalfNormal("subject_re_sigma", sigma=10)
+                    subject_offset = pm.Normal("subject_offset", mu=0, sigma=1, shape=n_subs)
+                    subject_effects = pm.Deterministic("RE", subject_offset * sigma_sub)
 
-                # linear predictor
-                # beta_intercept + ind(beta_0dB) + ind(beta_-6dB) + re_intercept + ind(re_0dB) + ind(re_-6dB)
-                eta_fixed = (cvnull[:, 1:] @ beta)   # fixed effects
-                eta = intercept + eta_fixed + exposure + subject_effects[subsnull]
+                    # linear predictor
+                    # beta_intercept + ind(beta_0dB) + ind(beta_-6dB) + re_intercept + ind(re_0dB) + ind(re_-6dB)
+                    eta_fixed = (cvnull[nullobs > 0, 1:] @ beta)   # fixed effects
+                    eta = intercept + eta_fixed + exposurenull[nullobs > 0] + subject_effects[subsnull[nullobs > 0]]
 
-                mu  = pm.Deterministic('mu', pm.math.exp(eta))
-                psi = pm.Beta("psi", 1, 1)
+                    mu  = pm.Deterministic('mu', pm.math.exp(eta))
+                    psi = pm.Beta("psi", 1, 1)
+
+                else:
+                    intercept = pm.Normal("intercept", mu=0, sigma=5)                 # population baseline log-mean
+                    beta = pm.Normal('beta', 0, 2, shape=(cvnull.shape[1]-1))
+                    sigma = pm.Exponential("sigma", 1)
+
+                    # random effects (1|subject)
+                    sigma_sub = pm.Exponential("subject_re_sigma", 1)
+                    subject_offset = pm.Normal("subject_offset", mu=0, sigma=1, shape=n_subs)
+                    subject_effects = pm.Deterministic("RE", subject_offset * sigma_sub)
+
+                    # linear predictor
+                    # beta_intercept + ind(beta_0dB) + ind(beta_-6dB) + re_intercept + ind(re_0dB) + ind(re_-6dB)
+                    eta_fixed = (cvnull[nullobs > 0, 1:] @ beta)   # fixed effects
+                    eta = intercept + eta_fixed + exposurenull[nullobs > 0] + subject_effects[subsnull[nullobs > 0]]
+
+                    mu  = pm.Deterministic('mu', eta)
+                    psi = pm.Beta("psi", 1, 1)
 
                 if modeltype == 'gamma':
                     sigma = pm.HalfNormal("sigma", sigma=1)
@@ -1675,6 +875,9 @@ def simple_worker_conditiononly_norandslopes_reduced_full(chunk):
                     lam_rel = pm.Beta("lam_rel", 2, 2)
                     lam = pm.Deterministic("lam", lower + lam_rel * (1.0 - lower))
                     y_obs = pmx.distributions.GeneralizedPoisson(mu=mu, lam=lam, observed=nullobs[nullobs > 0])
+                elif modeltype == 'lognormal':
+                    y_obs = pm.LogNormal("y_obs", mu=mu, sigma=sigma, observed=nullobs[nullobs>0])
+
 
                 pm.Bernoulli("y_bernoulli", p=1 - psi, observed=(nullobs == 0) * 1.0)
 
@@ -1684,7 +887,7 @@ def simple_worker_conditiononly_norandslopes_reduced_full(chunk):
 
                     try:
                         if nullmode == 'advi':
-                            approx = pm.fit(method='advi', progressbar=False, callbacks=[])
+                            approx = pm.fit(method='advi', progressbar=False, start=mcmc_means, callbacks=[])
                             tracefullnull = approx.sample(4000)
                         else:
                             tracefullnull = pm.sample(4000, chains=4, return_inferencedata=True, 
@@ -1701,7 +904,7 @@ def simple_worker_conditiononly_norandslopes_reduced_full(chunk):
                 # didn't go right
                 if badconvflag:
                     if nullmode == 'advi':
-                            approx = pm.fit(method='advi', progressbar=False, callbacks=[])
+                            approx = pm.fit(method='advi', progressbar=False, start=mcmc_means, callbacks=[])
                             tracefullnull = approx.sample(4000)
                     else:
                         tracefullnull = pm.sample(4000, chains=4, return_inferencedata=True, 
@@ -1718,104 +921,19 @@ def simple_worker_conditiononly_norandslopes_reduced_full(chunk):
                     "RE": post["RE"].mean(dim=("chain", "draw")).values,
                     "mu": _mu,
                     "psi": _psi,
-                    "exposure": exposure,
-                    "obs": obs,
+                    "exposure": exposurenull[nullobs > 0],
+                    "obs": nullobs,
                     "badconv": badconvflag,
+                    "clamp": clamp_idx,
                 }
                 rhat = None # az.rhat(tracefulltrue)
-                nullresults.append([i, j, nmi, rhat, posterior_subsamples])
-                
-                
-        # third stage: fit true model
-        
-        # fresh copy
-        obs = data[usemask]
-        cv = X[usemask]
-        subs = S[usemask]
-        design = Z[usemask]
-        n_conditions = cv.shape[1]
-
-        with pm.Model() as fullmodel_true:
-            # fixed effects parameters
-            intercept = pm.Normal("intercept", mu=0, sigma=10)                 # population baseline log-mean
-            beta = pm.Normal('beta', 0, 5, shape=(n_conditions-1))
-
-            # random effects (1|subject)
-            sigma_sub = pm.HalfNormal("subject_re_sigma", sigma=10)
-            subject_offset = pm.Normal("subject_offset", mu=0, sigma=1, shape=n_subs)
-            subject_effects = pm.Deterministic("RE", subject_offset * sigma_sub)
-
-            # linear predictor
-            # beta_intercept + ind(beta_0dB) + ind(beta_-6dB) + re_intercept + ind(re_0dB) + ind(re_-6dB)
-            eta_fixed = (cv[obs > 0, 1:] @ beta)   # fixed effects
-            eta = intercept + eta_fixed + exposure + subject_effects[subs[obs > 0]]
-
-            mu  = pm.Deterministic('mu', pm.math.exp(eta))
-            psi = pm.Beta("psi", 1, 1)
-
-            if modeltype == 'gamma':
-                sigma = pm.HalfNormal("sigma", sigma=1)
-                y_obs = pm.Gamma("y_obs", mu=mu, sigma=sigma, observed=obs[obs > 0])
-            elif modeltype == 'poisson':
-                y_obs = pm.Poisson("y_obs", mu=mu, observed=obs[obs > 0])
-            elif modeltype == 'genpois':
-                lower = pm.math.maximum(-1.0, -mu / 4.0)
-                # fraction between lower and 1
-                lam_rel = pm.Beta("lam_rel", 2, 2)
-                lam = pm.Deterministic("lam", lower + lam_rel * (1.0 - lower))
-                y_obs = pmx.distributions.GeneralizedPoisson(mu=mu, lam=lam, observed=obs[obs>0])
-
-            pm.Bernoulli("y_bernoulli", p=1 - psi, observed=(obs == 0) * 1.0)
-
-            # see if sampler converges with obtaining invalid values
-            with warnings.catch_warnings():
-                warnings.simplefilter("error", RuntimeWarning)
-
-                try:
-                    tracefulltrue = pm.sample(4000, chains=4, return_inferencedata=True, 
-                            target_accept=0.95, cores=1, idata_kwargs={"log_likelihood": True}, 
-                            progressbar=False)
-                    badconvflag = False
-
-                except RuntimeWarning as e:
-                    print(f"true model {i}->{j} caught a RuntimeWarning exception:", e)
-                    badconvflag = True
-
-            # here the sampler will raise a runtime warning but will still proceed with sampling
-            # this way we will still obtain estimates, just with the knowledge that something
-            # didn't go right
-            if badconvflag:
-                tracefulltrue = pm.sample(4000, chains=4, return_inferencedata=True, 
-                            target_accept=0.95, cores=1, idata_kwargs={"log_likelihood": True}, 
-                            progressbar=False)
-
-            post = tracefulltrue.posterior
-            postpred = pm.sample_posterior_predictive(tracefulltrue, random_seed=0)
-            _intercept = post['intercept'].mean(dim=('chain', 'draw')).values
-            _mu = post['mu'].mean(dim=('chain', 'draw')).values
-            _psi = post['psi'].mean().item()
-            posterior_subsamples = {
-                "intercept": _intercept, 
-                "beta": post['beta'].mean(dim=('chain', 'draw')).values,
-                "RE": post["RE"].mean(dim=("chain", "draw")).values,
-                "mu": _mu,
-                "psi": _psi,
-                "exposure": exposure,
-                "obs": obs,
-                "predicted_samples": postpred,
-                "artificial_data": artificial_data,
-                "badconv": badconvflag,
-            }
-            rhat = None # az.rhat(tracefulltrue)
-            trueresults.append([i, j, 0, rhat, posterior_subsamples])
+                nullresults.append([i, j, nmi, rhat, posterior_subsamples])     
 
     return trueresults, nullresults
 
 
-def simple_worker_norandslopes_counterfactual(chunk):
-    import pymc_extras as pmx    
-
-    print(f"running integrated zip models process {os.getpid()}")
+def simple_worker(chunk):   
+    print(f"running integrated, covariate only ztp models process {os.getpid()}")
     if len(chunk) == 0:
         return None
     
@@ -1828,31 +946,24 @@ def simple_worker_norandslopes_counterfactual(chunk):
     nullresults = []
     for i, j, data, X, Z, nullstartidx, nullblocksize, S, usemask, mode in chunk:
         nullmode = mode["nullmode"]
-        reducedmode = mode["reducedmode"]
         nullppc = mode["nullppc"]
-        exposure = np.log(mode["exposure"])
+        exposure = mode["exposure"]
         modeltype = mode["modeltype"]
 
         obs = data[usemask]
         cv = X[usemask]
         subs = S[usemask]
         design = Z[usemask]
-        n_conditions = cv.shape[1]
+        exposure = exposure[usemask]
 
         with pm.Model() as fullmodel_true:
             # fixed effects parameters
             intercept = pm.Normal("intercept", mu=0, sigma=10)                 # population baseline log-mean
-            beta = pm.Normal('beta', 0, 5, shape=(n_conditions-1))
-
-            # random effects (1|subject)
-            sigma_sub = pm.HalfNormal("subject_re_sigma", sigma=10)
-            subject_offset = pm.Normal("subject_offset", mu=0, sigma=1, shape=n_subs)
-            subject_effects = pm.Deterministic("RE", subject_offset * sigma_sub)
+            beta = pm.Normal('beta', 0, 5, shape=(1))
 
             # linear predictor
-            # beta_intercept + ind(beta_0dB) + ind(beta_-6dB) + re_intercept + ind(re_0dB) + ind(re_-6dB)
             eta_fixed = (cv[obs > 0, 1:] @ beta)   # fixed effects
-            eta = intercept + eta_fixed + exposure + subject_effects[subs[obs > 0]]
+            eta = intercept + eta_fixed + exposure[obs > 0]
 
             mu  = pm.Deterministic('mu', pm.math.exp(eta))
             psi = pm.Beta("psi", 1, 1)
@@ -1905,7 +1016,6 @@ def simple_worker_norandslopes_counterfactual(chunk):
             posterior_subsamples = {
                 "intercept": _intercept, 
                 "beta": post['beta'].mean(dim=('chain', 'draw')).values,
-                "RE": post["RE"].mean(dim=("chain", "draw")).values,
                 "mu": _mu,
                 "psi": _psi,
                 "exposure": exposure,
@@ -1917,7 +1027,7 @@ def simple_worker_norandslopes_counterfactual(chunk):
             trueresults.append([i, j, 0, rhat, posterior_subsamples])
         
         # counterfactual model with beta forced to 0 but all other params as in full model
-        with pm.do(fullmodel_true, {beta: [0.0] * (n_conditions-1)}) as m_do:
+        with pm.do(fullmodel_true, {beta: [0.0]}) as m_do:
             postpred_do = pm.sample_posterior_predictive(tracefulltrue, random_seed=0)
             
         artificial_data = postpred_do.posterior_predictive['y_obs'].values.reshape(4 * 4000, -1) # (n_chain x n_samples, n_obs * 3)
@@ -1934,6 +1044,7 @@ def simple_worker_norandslopes_counterfactual(chunk):
             nullobs = artificial_data[nmi]
             cvnull = cv[obs > 0] # the artificial data are derived from only nonzero observations
             subsnull = subs[obs > 0]
+            exposurenull = exposure[obs > 0]
 
             print(f"link {j}->{i} running null model {nmi}")
 
@@ -1941,17 +1052,11 @@ def simple_worker_norandslopes_counterfactual(chunk):
             with pm.Model() as nullmodel:
                 # fixed effects parameters
                 intercept = pm.Normal("intercept", mu=0, sigma=10)                 # population baseline log-mean
-                beta = pm.Normal('beta', 0, 5, shape=(n_conditions-1))
-
-                # random effects (1|subject)
-                sigma_sub = pm.HalfNormal("subject_re_sigma", sigma=10)
-                subject_offset = pm.Normal("subject_offset", mu=0, sigma=1, shape=n_subs)
-                subject_effects = pm.Deterministic("RE", subject_offset * sigma_sub)
+                beta = pm.Normal('beta', 0, 5, shape=(1))
 
                 # linear predictor
-                # beta_intercept + ind(beta_0dB) + ind(beta_-6dB) + re_intercept + ind(re_0dB) + ind(re_-6dB)
                 eta_fixed = (cvnull[nullobs > 0, 1:] @ beta)   # fixed effects
-                eta = intercept + eta_fixed + exposure + subject_effects[subsnull[nullobs > 0]]
+                eta = intercept + eta_fixed + exposurenull[nullobs > 0] 
 
                 mu  = pm.Deterministic('mu', pm.math.exp(eta))
                 psi = pm.Beta("psi", 1, 1)
@@ -2007,10 +1112,9 @@ def simple_worker_norandslopes_counterfactual(chunk):
                 posterior_subsamples = {
                     "intercept": _intercept, 
                     "beta": post['beta'].mean(dim=('chain', 'draw')).values,
-                    "RE": post["RE"].mean(dim=("chain", "draw")).values,
                     "mu": _mu,
                     "psi": _psi,
-                    "exposure": exposure,
+                    "exposure": exposurenull[nullobs > 0],
                     "obs": obs,
                     "badconv": badconvflag,
                 }
@@ -2020,159 +1124,28 @@ def simple_worker_norandslopes_counterfactual(chunk):
     return trueresults, nullresults
 
 
-def run_variational_bayes(chunks):
-    # receives a chunk of the connectivity data 
-    # (link pairs and associated data) and splits the
-    # task among the cores available on the machine.
-    # aggregates the results and returns them to server
-
-    with Pool() as pool:
-        res = list(pool.imap(worker, chunks)) # each worker gets one chunk at a time
-
-    return res
-
-def run_variational_bayes_simple(chunks):
-    # receives a chunk of the connectivity data 
-    # (link pairs and associated data) and splits the
-    # task among the cores available on the machine.
-    # aggregates the results and returns them to server
-
-    with Pool() as pool:
-        res = list(pool.imap(simple_worker, chunks)) # each worker gets one chunk at a time
-
-    return res
-
-def run_variational_bayes_simple_negbin(chunks):
-    # receives a chunk of the connectivity data 
-    # (link pairs and associated data) and splits the
-    # task among the cores available on the machine.
-    # aggregates the results and returns them to server
-
-    with Pool() as pool:
-        res = list(pool.imap(simple_worker_negbin, chunks)) # each worker gets one chunk at a time
-
-    return res
-
-def run_variational_bayes_simple_zip(chunks):
-    # receives a chunk of the connectivity data 
-    # (link pairs and associated data) and splits the
-    # task among the cores available on the machine.
-    # aggregates the results and returns them to server
-
-    with Pool() as pool:
-        res = list(pool.imap(simple_worker_zip, chunks)) # each worker gets one chunk at a time
-
-    return res
-
-
-def run_variational_bayes_simple_zip_twostage(chunks):
+def counterfactual_run_worker(chunks):
     # receives a chunk of the connectivity data 
     # (link pairs and associated data) and splits the
     # task among the cores available on the machine.
     # aggregates the results and returns them to server
 
     with multiprocessing.get_context('spawn').Pool() as pool:
-        res = list(pool.map(simple_worker_zip_twostage, chunks)) # each worker gets one chunk at a time
+        res = list(pool.map(simple_worker, chunks)) # each worker gets one chunk at a time
 
     print("transmit")
+    subprocess.call(["rm", "-rf", "/export/vrishab/compile"])
+    print("clear cache")
     return res
 
-def run_variational_bayes_simple_zip_reduced_full(chunks):
+def counterfactual_run_general_worker(chunks):
     # receives a chunk of the connectivity data 
     # (link pairs and associated data) and splits the
     # task among the cores available on the machine.
     # aggregates the results and returns them to server
 
     with multiprocessing.get_context('spawn').Pool() as pool:
-        res = list(pool.map(simple_worker_zip_reduced_full, chunks)) # each worker gets one chunk at a time
-
-    print("transmit")
-    return res
-
-def run_variational_bayes_integrated_zi_reduced_full(chunks):
-    # receives a chunk of the connectivity data 
-    # (link pairs and associated data) and splits the
-    # task among the cores available on the machine.
-    # aggregates the results and returns them to server
-
-    with multiprocessing.get_context('spawn').Pool() as pool:
-        res = list(pool.map(integrated_worker_zi_reduced_full, chunks)) # each worker gets one chunk at a time
-
-    print("transmit")
-    return res
-
-def run_variational_bayes_interceptonly_zigenpois(chunks):
-    # receives a chunk of the connectivity data 
-    # (link pairs and associated data) and splits the
-    # task among the cores available on the machine.
-    # aggregates the results and returns them to server
-
-    with multiprocessing.get_context('spawn').Pool() as pool:
-        res = list(pool.map(simple_worker_zigenpois_interceptonly, chunks)) # each worker gets one chunk at a time
-
-    print("transmit")
-    return res
-
-def run_variational_bayes_conditiononly_zip(chunks):
-    # receives a chunk of the connectivity data 
-    # (link pairs and associated data) and splits the
-    # task among the cores available on the machine.
-    # aggregates the results and returns them to server
-
-    with multiprocessing.get_context('spawn').Pool() as pool:
-        res = list(pool.map(simple_worker_zip_conditiononly, chunks)) # each worker gets one chunk at a time
-
-    print("transmit")
-    return res
-
-def run_variational_bayes_conditiononly_norandslopes_zip(chunks):
-    # receives a chunk of the connectivity data 
-    # (link pairs and associated data) and splits the
-    # task among the cores available on the machine.
-    # aggregates the results and returns them to server
-
-    with multiprocessing.get_context('spawn').Pool() as pool:
-        res = list(pool.map(simple_worker_zip_conditiononly_norandslopes, chunks)) # each worker gets one chunk at a time
-
-    print("transmit")
-    return res
-
-
-def run_variational_bayes_conditiononly_norandslopes(chunks):
-    # receives a chunk of the connectivity data 
-    # (link pairs and associated data) and splits the
-    # task among the cores available on the machine.
-    # aggregates the results and returns them to server
-
-    with multiprocessing.get_context('spawn').Pool() as pool:
-        res = list(pool.map(simple_worker_conditiononly_norandslopes, chunks)) # each worker gets one chunk at a time
-
-    print("transmit")
-    return res
-
-
-def run_variational_bayes_conditiononly_norandslopes_reduced_full(chunks):
-    # receives a chunk of the connectivity data 
-    # (link pairs and associated data) and splits the
-    # task among the cores available on the machine.
-    # aggregates the results and returns them to server
-
-    with multiprocessing.get_context('spawn').Pool() as pool:
-        res = list(pool.map(simple_worker_conditiononly_norandslopes_reduced_full, chunks)) # each worker gets one chunk at a time
-
-    print("transmit")
-    return res
-
-
-def run_variational_bayes_norandslopes_counterfactual(chunks):
-    import subprocess
-    # receives a chunk of the connectivity data 
-    # (link pairs and associated data) and splits the
-    # task among the cores available on the machine.
-    # aggregates the results and returns them to server
-
-    with multiprocessing.get_context('spawn').Pool() as pool:
-        res = list(pool.map(simple_worker_norandslopes_counterfactual, chunks)) # each worker gets one chunk at a time
+        res = list(pool.map(general_worker, chunks)) # each worker gets one chunk at a time
 
     print("transmit")
     subprocess.call(["rm", "-rf", "/export/vrishab/compile"])
@@ -2180,15 +1153,26 @@ def run_variational_bayes_norandslopes_counterfactual(chunks):
     return res
 
 
-def run_variational_bayes_clang(chunks):
+def counterfactual_run_worker_randint(chunks):
     # receives a chunk of the connectivity data 
     # (link pairs and associated data) and splits the
     # task among the cores available on the machine.
     # aggregates the results and returns them to server
 
-    pytensor.config.cxx = '/usr/bin/clang++'
+    with multiprocessing.get_context('spawn').Pool() as pool:
+        res = list(pool.map(simple_worker_randint, chunks)) # each worker gets one chunk at a time
 
-    with Pool() as pool:
-        res = list(pool.imap(worker, chunks)) # each worker gets one chunk at a time
+    print("transmit")
+    subprocess.call(["rm", "-rf", "/export/vrishab/compile"])
+    print("clear cache")
+    return res
 
+
+def counterfactual_power_analysis(chunks):
+    with multiprocessing.get_context('spawn').Pool() as pool:
+        res = list(pool.map(power_analysis, chunks)) # each worker gets one chunk at a time
+
+    print("transmit")
+    subprocess.call(["rm", "-rf", "/export/vrishab/compile"])
+    print("clear cache")
     return res
