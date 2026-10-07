@@ -1,7 +1,7 @@
-from setuptools import setup
+from setuptools import setup, find_packages
 
 setup(
-    name='variational_bayes',
-    version='0.1',
-    py_modules=['multiprocess_variational_bayes'],
+    name="network_regression",
+    version="0.1",
+    packages=find_packages(),
 )
