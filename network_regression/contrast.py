@@ -48,7 +48,7 @@ def build_contrast(df: pd.DataFrame, config: ContrastConfig) -> Contrast:
     else:
         group_A_reference_level = config.interventions[group_A_regressor]
 
-    group_A_indices = df[group_A_regressor] == group_A_reference_level
+    group_A_indices = df[group_A_regressor].values == group_A_reference_level
 
     return Contrast(
         group_A_regressor = group_A_regressor,

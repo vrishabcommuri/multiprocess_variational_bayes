@@ -5,7 +5,7 @@ import eelfarm
 import numpy as np
 import pandas as pd
 
-from network_regression.contrast import ContrastConfig
+from network_regression.contrast import ContrastConfig, Contrast
 from network_regression.dataops import ScaledData, extract_single_link_data
 from network_regression.linkwise_regression import counterfactual_run_general_worker
 
@@ -14,7 +14,8 @@ from network_regression.linkwise_regression import counterfactual_run_general_wo
 class Job:
     src: int
     targ: int
-    contrast: ContrastConfig
+    contrastconfig: ContrastConfig
+    contrast: Contrast
     linkdata: pd.DataFrame
     posteriormode: str | None = 'positiveconditional' # return mu only, save mem
 
@@ -26,7 +27,7 @@ class Chunk:
 
 @dataclass
 class FarmConfig:
-    n_compute_groups: int = 100  # each is a set of cores assigned to a task
+    n_compute_groups: int = 50   # each is a set of cores assigned to a task
     n_cores: int = 10            # cores per group
     server_ip: str = 'localhost'        
     results_dir: str = './'
@@ -47,6 +48,7 @@ def chunk_data(
         df: pd.DataFrame, 
         farmconfig: FarmConfig, 
         contrastconfig: ContrastConfig,
+        contrast: Contrast,
         posteriormode: str | None = 'positiveconditional',
     ) -> list[Chunk]:
     """
@@ -62,13 +64,16 @@ def chunk_data(
     for splitpairs in splits:
         jobs = []
         for src, targ in splitpairs:
-            linkdata = extract_single_link_data(data, df, src, targ, eps=0.01)
+            linkdata, subsetcontrast = extract_single_link_data(data, contrast, 
+                                                                df, src, targ, 
+                                                                eps=0.01)
 
             job = Job(
                 src = src,
                 targ = targ,
                 linkdata = linkdata,
-                contrast = contrastconfig,
+                contrastconfig = contrastconfig,
+                contrast = subsetcontrast,
                 posteriormode = posteriormode,
             )
             jobs.append(job)

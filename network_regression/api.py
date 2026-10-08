@@ -41,7 +41,7 @@ class NetworkTest:
             regressors: list[str],
             priors: dict[str, dict[str, bmb.Prior]],
             interventions: dict[str, list[float]],
-            posteriormode: str | None = 'positiveconditional',
+            posteriormode: str | None = 'applycontrastpositiveconditional',
         ):
         """
         initial fit.
@@ -71,7 +71,7 @@ class NetworkTest:
         scaleddata = data_rescale_threshold(df_dsn, self.dataopsconfig)
 
         chunks = chunk_data(scaleddata, df_dsn, self.farmconfig, 
-                            contrastconfig, posteriormode)
+                            contrastconfig, contrast, posteriormode)
 
         self.chunks = chunks
 
@@ -95,6 +95,7 @@ class NetworkTest:
         statmaps = marshal(n_files, resultsdir, self.transformconfig, 
                            self.contrast)
         self.statmaps = statmaps
+        return statmaps
 
     def infer(self):
         """

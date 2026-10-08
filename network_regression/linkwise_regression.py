@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 import arviz as az
 import bambi as bmb
+import numpy as np
 import pandas as pd
 import pymc as pm
 import pytensor
@@ -25,6 +26,7 @@ N_DRAWS = 4000
 @dataclass
 class InferenceResult:
     is_counterfactual: bool
+    posteriormode: str | None
     src: int
     targ: int
     rhat_nonzero: Any | None
@@ -33,6 +35,8 @@ class InferenceResult:
     posterior_p: az.InferenceData
     data_nonzero: pd.DataFrame | None
     data_zero: pd.DataFrame | None
+    mu_a: np.array | None
+    mu_b: np.array | None
 
 @dataclass
 class WorkerResult:
@@ -51,14 +55,20 @@ def general_worker(
     os.environ["PYTENSOR_FLAGS"] = f"compiledir={compiledir}"
     
     results = []
+    firstposteriormode = None
 
-    for job in chunk.jobs:
+    for jidx, job in enumerate(chunk.jobs):
+        # ensure that all jobs share the same posteriormode
+        if jidx == 0:
+            firstposteriormode = job.posteriormode
+        assert firstposteriormode == job.posteriormode
+        
         src = job.src 
         targ = job.targ 
         data_full = job.linkdata 
-        formulae = job.contrast.formulae
-        priors = job.contrast.priors
-        interventions = job.contrast.interventions
+        formulae = job.contrastconfig.formulae
+        priors = job.contrastconfig.priors
+        interventions = job.contrastconfig.interventions
 
         assert isinstance(data_full, pd.DataFrame), \
             "data object must be a pandas dataframe"
@@ -69,7 +79,8 @@ def general_worker(
         assert 'zero' in priors and 'nonzero' in priors, \
             "zero and nonzero model priors must be provided (can be None)"
         
-        data = data_full[data_full.connectivity > 0]
+        nzidxs = data_full.connectivity > 0
+        data = data_full[nzidxs]
         data_binary = data_full.copy()
         data_binary['connectivity'] = data_binary.connectivity == 0
         
@@ -143,27 +154,58 @@ def general_worker(
             
         posterior = tracefulltrue.posterior
         posteriorbool = tracefulltruebool.posterior
+
         post_mu = posterior.mu
         post_cf_mu = postpred_do.posterior_predictive.mu
-        
-        
         rhatnz = az.rhat(tracefulltrue)
 
+        post_p = posteriorbool.p
+        post_cf_p = postpred_bool_do.posterior_predictive.p
+        rhatbool = az.rhat(tracefulltruebool)
+
+        mu_a = None
+        mu_b = None
+        mu_a_cf = None
+        
         if job.posteriormode is None:
-            post_p = posteriorbool.p
-            post_cf_p = postpred_bool_do.posterior_predictive.p
-            rhatbool = az.rhat(tracefulltruebool)
+            pass
         elif job.posteriormode == 'positiveconditional': # save mem
             post_p = None
             post_cf_p = None
             rhatbool = None
             data_binary = None
+        elif job.posteriormode == 'applycontrastpositiveconditional':
+            obsmu = post_mu.values.reshape(N_CHAINS * N_DRAWS, -1)
+            # obsp = post_p.values.reshape(N_CHAINS * N_DRAWS, -1)
+
+            nullmu = post_cf_mu.values.reshape(N_CHAINS * N_DRAWS, -1)
+            # nullp = post_cf_p.values.reshape(N_CHAINS * N_DRAWS, -1)
+            
+            # point estimates
+            mu_a = obsmu[:, ~job.contrast.group_A_indices[nzidxs]].mean()
+            mu_b = obsmu[:, job.contrast.group_A_indices[nzidxs]].mean()
+
+            # distribution
+            mu_a_cf = nullmu[:, ~job.contrast.group_A_indices[nzidxs]]\
+                            .mean(axis=1)
+
+            # zero out extraneous fields to save mem
+            rhatbool = None
+            post_mu = None
+            post_p = None
+            data = None
+            data_binary = None
+            post_cf_mu = None
+            post_cf_p = None
+
         else:
             raise ValueError(f"posteriormode {job.posteriormode} not one of "
-                             "None or positiveconditional")
+                             "None, positiveconditional, or "
+                             "applycontrastpositiveconditional")
         
         obs_result = InferenceResult(
             is_counterfactual = False,
+            posteriormode = job.posteriormode,
             src = src,
             targ = targ,
             rhat_nonzero = rhatnz,
@@ -171,11 +213,14 @@ def general_worker(
             posterior_mu = post_mu,
             posterior_p = post_p,
             data_nonzero = data, 
-            data_zero = data_binary
+            data_zero = data_binary,
+            mu_a = mu_a,
+            mu_b = mu_b,
         )
 
         cf_result = InferenceResult(
             is_counterfactual = True,
+            posteriormode = job.posteriormode,
             src = src,
             targ = targ,
             rhat_nonzero = None,        # avoid duplicate in observed result 
@@ -183,7 +228,9 @@ def general_worker(
             posterior_mu = post_cf_mu,
             posterior_p = post_cf_p,
             data_nonzero = None,        # avoid duplicate in observed result 
-            data_zero = None            # avoid duplicate in observed result 
+            data_zero = None,           # avoid duplicate in observed result 
+            mu_a = mu_a_cf,
+            mu_b = None
         )
 
         results.append(WorkerResult(

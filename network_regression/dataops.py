@@ -1,7 +1,10 @@
+import copy
 from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+
+from network_regression.contrast import Contrast
 
 
 @dataclass
@@ -56,6 +59,7 @@ def data_rescale_threshold(
 
 def extract_single_link_data(
         data: ScaledData, 
+        contrast: Contrast,
         df: pd.DataFrame, 
         src: int, 
         targ: int, 
@@ -66,6 +70,7 @@ def extract_single_link_data(
     useidxs = data.usemask
 
     df = df.copy()
+    subsetcontrast = copy.deepcopy(contrast)
     
     # replace connectivity data for this link with preprocessed values
     df['connectivity'] = data_count[:, targ, src]
@@ -76,5 +81,6 @@ def extract_single_link_data(
 
     # drop trials with too few links
     df = df.iloc[useidxs]
+    subsetcontrast.group_A_indices = subsetcontrast.group_A_indices[useidxs]
 
-    return df
+    return df, subsetcontrast
