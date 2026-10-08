@@ -129,7 +129,7 @@ def general_worker(
         
         try:
             # counterfactual for nonzero model
-            with pm.do(fullmodel_true, interventions) as m_do:
+            with pm.do(fullmodel_true, interventions) as m_do:      
                 postpred_do = pm.sample_posterior_predictive(
                     tracefulltrue,
                     var_names=["mu"],  
@@ -137,7 +137,7 @@ def general_worker(
                 )
 
             # counterfactual for bool model
-            with pm.do(fullmodel_true_bool, interventions) as m_do:
+            with pm.do(fullmodel_true_bool, interventions) as m_do: # noqa: F841
                 postpred_bool_do = pm.sample_posterior_predictive(
                     tracefulltruebool,
                     var_names=["p"],  
@@ -254,7 +254,8 @@ def counterfactual_run_general_worker(
     worker = partial(general_worker, compilebasedir=compiledir)
 
     with multiprocessing.get_context('spawn').Pool() as pool:
-        res = list(pool.map(worker, chunks)) # each worker gets one chunk at a time
+        # each worker gets one chunk at a time
+        res = list(pool.map(worker, chunks)) 
 
     print("transmit")
     subprocess.call(["rm", "-rf", compiledir])

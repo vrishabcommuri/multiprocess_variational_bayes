@@ -197,6 +197,7 @@ def downsample_smooth_normalize(
     ############################################################################
     # set up transforms
     ############################################################################
+
     if transformconfig.blossom_downsample:
         n_roi = transformconfig.blossom_num_regions
         anat, _ = create_balanced_transform(src_target, n_super_hemi=n_roi)
@@ -227,7 +228,7 @@ def downsample_smooth_normalize(
     ############################################################################
     
     df = df.copy()
-    
+
     # invariant: for historical reasons, the 'B' statistic is what we call the
     # count-normalized J statistc
     df.insert(0, 'B', 

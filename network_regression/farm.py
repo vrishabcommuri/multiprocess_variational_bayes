@@ -1,11 +1,11 @@
 from dataclasses import dataclass, field
 from typing import Any
 
-import eelfarm
+import eelfarm  # type: ignore
 import numpy as np
 import pandas as pd
 
-from network_regression.contrast import ContrastConfig, Contrast
+from network_regression.contrast import Contrast, ContrastConfig
 from network_regression.dataops import ScaledData, extract_single_link_data
 from network_regression.linkwise_regression import counterfactual_run_general_worker
 
@@ -115,7 +115,7 @@ def send_chunks(
                 chunks=chunks[datastart:dataend],
                 compiledir=compiledir,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             print(exc, "continuing")
             continue
 

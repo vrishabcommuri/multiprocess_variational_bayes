@@ -1,5 +1,6 @@
-import numpy as np
 from functools import partial
+
+import numpy as np
 from multiprocess import Pool
 from tqdm.notebook import tqdm
 
@@ -49,12 +50,7 @@ def extract_strongly_connected_components(adj_matrix):
             components.append(component)
 
     return components
-            
-def visited_to_array(visited, visited_heights, shape=(84, 84)):
-    Jout = np.zeros(shape)
-    for vidx, (source, target) in enumerate(visited):
-        Jout[target, source] = visited_heights[vidx]
-    return Jout
+
 
 def nbs_tfce_scc_enhance(statmap, E=1, H=1, hmax=1, steps=100, 
                          intensity_extent=False):
@@ -175,6 +171,9 @@ def network_cluster_permutation_test(statistic, null_distribution, E=2, H=3,
 def nbstfce_test(statistic, null_distribution, E=1, H=1, n_perm=10_000, 
                 intensity_extent=False, hypothesis='two-sided', verbose=False):
 
+    # (n_draws, n_roi, n_roi)
+    null_distribution = np.transpose(null_distribution, (2, 0, 1))
+    
     monte_carlo_p, enh, null_distribution_enhanced = \
         network_cluster_permutation_test(statistic, null_distribution, 
                          E=E, 

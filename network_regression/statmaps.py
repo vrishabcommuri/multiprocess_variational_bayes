@@ -43,7 +43,7 @@ def marshal(
                 mdata_grouped: list[list[WorkerResult]] = pickle.load(f)
 
         # bad load
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(e)
             continue
 
@@ -70,12 +70,12 @@ def marshal(
                 obsmu = truemodels.posterior_mu.values\
                             .reshape(N_CHAINS * N_DRAWS, -1)
                 obsp = truemodels.posterior_p.values\
-                            .reshape(N_CHAINS * N_DRAWS, -1)
+                            .reshape(N_CHAINS * N_DRAWS, -1)  # noqa: F841 TODO
 
                 nullmu = nullmodels.posterior_mu.values\
                             .reshape(N_CHAINS * N_DRAWS, -1)
                 nullp = nullmodels.posterior_p.values\
-                            .reshape(N_CHAINS * N_DRAWS, -1)
+                            .reshape(N_CHAINS * N_DRAWS, -1)  # noqa: F841 TODO
                 
                 # point estimates
                 mu_a = obsmu[:, ~contrast.group_A_indices].mean()

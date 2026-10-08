@@ -10,10 +10,10 @@ def plot_max_statistic_distribution(statmap, statmap_null):
 
     obs_tmax = statmap.max()
 
-    fig, ax = plt.subplots(figsize=(10, 4))
+    _, ax = plt.subplots(figsize=(10, 4))
 
     # histogram
-    n, bins, _ = ax.hist(
+    _, bins, _ = ax.hist(
         nulltmax,
         bins=60,
         density=True,

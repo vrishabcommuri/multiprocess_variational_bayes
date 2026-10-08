@@ -1,7 +1,8 @@
+from dataclasses import dataclass, field
+
+import bambi as bmb
 import numpy as np
 import pandas as pd
-from dataclasses import dataclass, field
-import bambi as bmb
 
 
 @dataclass

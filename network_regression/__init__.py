@@ -1,1 +1,1 @@
-from .api import NetworkTest
+from .api import NetworkTest  # noqa: F401

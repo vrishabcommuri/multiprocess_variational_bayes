@@ -50,7 +50,7 @@ class NetworkTest:
         2. Marshal the data into dataframe objects, appropriately constructed to
            reflect the regressor variables and intervention arms chosen
         3. Evalute prior hysteresis and reconcile prior data scale with data
-           scale
+           scale (TODO)
         4. Chunk data for farming.
         """
         contrastconfig = ContrastConfig(
