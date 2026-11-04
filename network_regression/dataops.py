@@ -4,14 +4,20 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from network_regression.contrast import Contrast
+from network_regression.contrast import (
+    Contrast,
+    ContrastConfig,
+    single_link_contrast_groups,
+)
 
 
 @dataclass
 class DataOpsConfig:
     support_percentile: int = 50
     min_count: int = 25
-    boost: int = 10_000
+    boost: int = 10_000           # offset applied to observation data
+    observation_column: str = 'B' # default behavior derives 'B' from 'J' stats
+    eps: float|None = 0.01
 
 @dataclass 
 class ScaledData:
@@ -25,7 +31,7 @@ def data_rescale_threshold(
         config: DataOpsConfig
     ) -> ScaledData:
     
-    data_raw = np.stack(df['B'].values)
+    data_raw = np.stack(df[config.observation_column].values)
     totals = np.stack(df['total'].values)
 
     # this is important for log scale models since small values become
@@ -63,7 +69,8 @@ def extract_single_link_data(
         df: pd.DataFrame, 
         src: int, 
         targ: int, 
-        eps=0.01
+        dataopsconfig: DataOpsConfig,
+        contrastconfig: ContrastConfig,
     ) -> pd.DataFrame:
     
     data_count = data.data_count
@@ -73,11 +80,31 @@ def extract_single_link_data(
     subsetcontrast = copy.deepcopy(contrast)
     
     # replace connectivity data for this link with preprocessed values
-    df['connectivity'] = data_count[:, targ, src]
-    df['B'] = np.stack(df['B'].values)[:, targ, src]
-    df['J'] = np.stack(df['J'].values)[:, targ, src]
+    df[dataopsconfig.observation_column] = data_count[:, targ, src]
 
-    df.loc[df.connectivity < eps, 'connectivity'] = 0 
+    if dataopsconfig.observation_column != 'B':
+        df['B'] = np.stack(df['B'].values)[:, targ, src]
+    if dataopsconfig.observation_column != 'J':
+        df['J'] = np.stack(df['J'].values)[:, targ, src]
+
+    idxd_regs = contrast.nonzeroterm_indexed_regressors + \
+                contrast.zeroterm_indexed_regressors
+    
+    for indexed_regressor in np.unique(idxd_regs):
+        # these were just sliced
+        if indexed_regressor in ['J', 'B', dataopsconfig.observation_column]:
+            continue
+        
+        df[indexed_regressor] = np.stack(df[indexed_regressor].values)\
+                                         [:, targ, src]
+
+    if dataopsconfig.eps:
+        df.loc[df[dataopsconfig.observation_column] < dataopsconfig.eps, 
+               dataopsconfig.observation_column] = 0 
+        
+    subsetcontrast = single_link_contrast_groups(df, 
+                                                 subsetcontrast, 
+                                                 contrastconfig)
 
     # drop trials with too few links
     df = df.iloc[useidxs]

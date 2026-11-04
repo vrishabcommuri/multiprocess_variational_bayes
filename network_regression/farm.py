@@ -6,7 +6,11 @@ import numpy as np
 import pandas as pd
 
 from network_regression.contrast import Contrast, ContrastConfig
-from network_regression.dataops import ScaledData, extract_single_link_data
+from network_regression.dataops import (
+    DataOpsConfig,
+    ScaledData,
+    extract_single_link_data,
+)
 from network_regression.linkwise_regression import counterfactual_run_general_worker
 
 
@@ -48,6 +52,7 @@ def chunk_data(
         df: pd.DataFrame, 
         farmconfig: FarmConfig, 
         contrastconfig: ContrastConfig,
+        dataopsconfig: DataOpsConfig,
         contrast: Contrast,
         posteriormode: str | None = 'positiveconditional',
     ) -> list[Chunk]:
@@ -66,7 +71,8 @@ def chunk_data(
         for src, targ in splitpairs:
             linkdata, subsetcontrast = extract_single_link_data(data, contrast, 
                                                                 df, src, targ, 
-                                                                eps=0.01)
+                                                                dataopsconfig, 
+                                                                contrastconfig)
 
             job = Job(
                 src = src,

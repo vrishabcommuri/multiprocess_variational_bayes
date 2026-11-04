@@ -48,6 +48,9 @@ def general_worker(
         chunk: Chunk, 
         compilebasedir: str
     ) -> list[WorkerResult]:
+
+    pytensor.config.cxx = "/usr/bin/clang++"
+
     print(f"running general model process {os.getpid()}")
     compiledir = f"{compilebasedir}/{os.getpid()}"
     pathlib.Path(compiledir).mkdir(parents=True, exist_ok=True)
@@ -72,17 +75,18 @@ def general_worker(
 
         assert isinstance(data_full, pd.DataFrame), \
             "data object must be a pandas dataframe"
-        assert "connectivity" in data_full.columns, \
-            "data must have connectivity as a column name"
         assert 'zero' in formulae and 'nonzero' in formulae, \
             "zero and nonzero model formulas must be provided"
         assert 'zero' in priors and 'nonzero' in priors, \
             "zero and nonzero model priors must be provided (can be None)"
         
-        nzidxs = data_full.connectivity > 0
+        nz_target_var = formulae['nonzero'].split("~")[0].strip()
+        z_target_var = formulae['zero'].split("~")[0].strip()
+        
+        nzidxs = data_full[nz_target_var] != 0
         data = data_full[nzidxs]
         data_binary = data_full.copy()
-        data_binary['connectivity'] = data_binary.connectivity == 0
+        data_binary[z_target_var] = data_binary[z_target_var] == 0
         
          # fit nonzero terms; hurdle doesn't work in bambi
         fullmodel_true = bmb.Model(formulae['nonzero'], 
@@ -109,7 +113,7 @@ def general_worker(
                                     target_accept=0.97, 
                                     cores=1, 
                                     idata_kwargs={"log_likelihood": True}, 
-                                    progressbar=False)
+                                    progressbar=True)
 
             with fullmodel_true_bool:
                 tracefulltruebool = pm.sample(N_DRAWS, 
@@ -118,7 +122,7 @@ def general_worker(
                                     target_accept=0.97, 
                                     cores=1, 
                                     idata_kwargs={"log_likelihood": True}, 
-                                    progressbar=False)
+                                    progressbar=True)
         except ValueError as ex:
             print("worker received valueerror for observed models"
                   f"({src}, {targ}): '{ex}' \n"
@@ -249,8 +253,6 @@ def counterfactual_run_general_worker(
     # (link pairs and associated data) and splits the
     # task among the cores available on the machine.
     # aggregates the results and returns them to server
-    pytensor.config.cxx = "/usr/bin/clang++"
-
     worker = partial(general_worker, compilebasedir=compiledir)
 
     with multiprocessing.get_context('spawn').Pool() as pool:

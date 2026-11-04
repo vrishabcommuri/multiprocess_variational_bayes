@@ -12,6 +12,7 @@ from network_regression.statmaps import marshal
 from network_regression.tfce import nbstfce_test
 from network_regression.linkwise_regression import N_CHAINS, N_DRAWS
 import copy
+from typing import Any
 
 class NetworkTest:
     def __init__(self, 
@@ -38,9 +39,9 @@ class NetworkTest:
     def fit(self, 
             df: pd.DataFrame, 
             formulae: dict[str, str],    
-            regressors: list[str],
             priors: dict[str, dict[str, bmb.Prior]],
             interventions: dict[str, list[float]],
+            contrast: dict[str, Any],
             posteriormode: str | None = 'applycontrastpositiveconditional',
         ):
         """
@@ -55,9 +56,9 @@ class NetworkTest:
         """
         contrastconfig = ContrastConfig(
             formulae=formulae,
-            regressors=regressors,
             priors=priors,
-            interventions=interventions
+            interventions=interventions,
+            contrast=contrast,
         )
 
         contrast = build_contrast(copy.deepcopy(df), 
@@ -70,8 +71,12 @@ class NetworkTest:
 
         scaleddata = data_rescale_threshold(df_dsn, self.dataopsconfig)
 
+        self.scaleddata = scaleddata
+        self.df_dsn = df_dsn
+
         chunks = chunk_data(scaleddata, df_dsn, self.farmconfig, 
-                            contrastconfig, contrast, posteriormode)
+                            contrastconfig, self.dataopsconfig, contrast,
+                            posteriormode)
 
         self.chunks = chunks
 
@@ -104,7 +109,8 @@ class NetworkTest:
         statistic = self.statmaps.statmap
         null_distribution = self.statmaps.statmap_null
 
-        nbstfce_test(statistic, 
+        monte_carlo_p, enh, null_distribution_enhanced = \
+            nbstfce_test(statistic, 
                      null_distribution, 
                      E = 0.75, 
                      H = 3.25, 
@@ -112,3 +118,9 @@ class NetworkTest:
                      intensity_extent = True, 
                      hypothesis = 'two-sided', 
                      verbose = False)
+        
+        self.monte_carlo_p = monte_carlo_p
+        self.enh = enh
+        self.null_distribution_enhanced = null_distribution_enhanced
+        
+        return monte_carlo_p, enh, null_distribution_enhanced

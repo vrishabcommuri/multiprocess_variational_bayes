@@ -238,6 +238,18 @@ def downsample_smooth_normalize(
         )
     )
 
+    for regval, regressor in zip(df.iloc[0].values, df.columns):
+        # these ones are special: J is left in native space, B was just morphed
+        if regressor in ["J", "B"]:
+            continue
+        
+        # all other array regressors get morphed to match shapes
+        if isinstance(regval, np.ndarray) and len(regval.shape) == 2:
+            df[regressor] = df.apply(
+                lambda x: morph.T @ x[regressor] @ morph, 
+                axis=1
+            )
+
     df.insert(0, 'total', df.apply(lambda x: x['J'].sum(), axis=1))
 
     return df
