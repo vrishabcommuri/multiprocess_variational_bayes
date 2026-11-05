@@ -191,8 +191,8 @@ def general_worker(
             mu_a_cf = nullmu
         
             # save mem
-            np.random.shuffle(mu_a_cf)
-            mu_a_cf = mu_a_cf[:n_subsample]
+            n_skip = (N_CHAINS * N_DRAWS) // n_subsample
+            mu_a_cf = mu_a_cf[::n_skip]
 
             # zero out extraneous fields to save mem
             rhatbool = None
