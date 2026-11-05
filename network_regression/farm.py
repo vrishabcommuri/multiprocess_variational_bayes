@@ -36,6 +36,7 @@ class FarmConfig:
     server_ip: str = 'localhost'        
     results_dir: str = './'
     compile_dir: str = '~/compile'
+    n_subsample: int = 1000
 
 
 def get_link_pairs(data: ScaledData) -> np.array:
@@ -120,6 +121,7 @@ def send_chunks(
                 counterfactual_run_general_worker, 
                 chunks=chunks[datastart:dataend],
                 compiledir=compiledir,
+                n_subsample=farmconfig.n_subsample,
             )
         except Exception as exc:  # noqa: BLE001
             print(exc, "continuing")

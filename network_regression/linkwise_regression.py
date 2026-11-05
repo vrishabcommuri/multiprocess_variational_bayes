@@ -22,7 +22,6 @@ if TYPE_CHECKING:
 N_CHAINS = 4
 N_DRAWS = 4000
 
-
 @dataclass
 class InferenceResult:
     is_counterfactual: bool
@@ -46,7 +45,8 @@ class WorkerResult:
 
 def general_worker(
         chunk: Chunk, 
-        compilebasedir: str
+        compilebasedir: str,
+        n_subsample: int,
     ) -> list[WorkerResult]:
 
     pytensor.config.cxx = "/usr/bin/clang++"
@@ -178,6 +178,30 @@ def general_worker(
             post_cf_p = None
             rhatbool = None
             data_binary = None
+        elif job.posteriormode == 'chainmeanpositiveconditional': # save mem
+            obsmu = post_mu.values.reshape(N_CHAINS * N_DRAWS, -1)
+            nullmu = post_cf_mu.values.reshape(N_CHAINS * N_DRAWS, -1)
+            
+            # average all within/between chain values, but retain
+            # per-observation values
+            mu_a = obsmu.mean(axis=0) 
+            mu_b = None
+
+            # distribution
+            mu_a_cf = nullmu
+        
+            # save mem
+            np.random.shuffle(mu_a_cf)
+            mu_a_cf = mu_a_cf[:n_subsample]
+
+            # zero out extraneous fields to save mem
+            rhatbool = None
+            post_mu = None
+            post_p = None
+            data_binary = None
+            post_cf_mu = None
+            post_cf_p = None
+
         elif job.posteriormode == 'applycontrastpositiveconditional':
             obsmu = post_mu.values.reshape(N_CHAINS * N_DRAWS, -1)
             # obsp = post_p.values.reshape(N_CHAINS * N_DRAWS, -1)
@@ -247,13 +271,16 @@ def general_worker(
 
 def counterfactual_run_general_worker(
         chunks: list[Chunk], 
-        compiledir: str
+        compiledir: str,
+        n_subsample: int,
     ) -> list[WorkerResult]:
     # receives a chunk of the connectivity data 
     # (link pairs and associated data) and splits the
     # task among the cores available on the machine.
     # aggregates the results and returns them to server
-    worker = partial(general_worker, compilebasedir=compiledir)
+    worker = partial(general_worker, 
+                     compilebasedir=compiledir, 
+                     n_subsample=n_subsample)
 
     with multiprocessing.get_context('spawn').Pool() as pool:
         # each worker gets one chunk at a time
