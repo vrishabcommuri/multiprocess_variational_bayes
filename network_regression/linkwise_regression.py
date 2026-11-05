@@ -104,7 +104,7 @@ def general_worker(
         
         fullmodel_true_bool.build()
         fullmodel_true_bool = fullmodel_true_bool.backend.model
-        
+
         try:
             with fullmodel_true:
                 tracefulltrue = pm.sample(N_DRAWS, 

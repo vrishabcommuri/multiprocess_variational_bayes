@@ -65,10 +65,12 @@ class NetworkTest:
                                   contrastconfig)
         self.contrast = contrast
 
-        df_dsn = downsample_smooth_normalize(copy.deepcopy(df), 
+        df_dsn, morph = downsample_smooth_normalize(copy.deepcopy(df), 
                                              self.sourcespace, 
                                              self.transformconfig)
-
+        
+        self.morph = morph
+        
         scaleddata = data_rescale_threshold(df_dsn, self.dataopsconfig)
 
         self.scaleddata = scaleddata

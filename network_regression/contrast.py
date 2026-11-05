@@ -91,7 +91,7 @@ def single_link_contrast_groups(
             f"levels of factor {group_A_regressor}"
 
     # cutpoint
-    group_A_indices = df[group_A_regressor].values <= group_A_reference_level
+    group_A_indices = df[group_A_regressor].values == group_A_reference_level
 
     contrast.group_A_indices = group_A_indices
     contrast.group_A_regressor = group_A_regressor

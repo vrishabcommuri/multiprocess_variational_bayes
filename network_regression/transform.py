@@ -252,4 +252,4 @@ def downsample_smooth_normalize(
 
     df.insert(0, 'total', df.apply(lambda x: x['J'].sum(), axis=1))
 
-    return df
+    return df, morph
